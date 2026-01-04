@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// PROJECT: claude-automation
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -8,6 +9,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { spawn } from "child_process";
 import { randomBytes } from "crypto";
+import { readdirSync, readFileSync, statSync } from "fs";
+import { join } from "path";
 import { z } from "zod";
 
 const NATS_URL = process.env.NATS_URL || "nats://localhost:4222";
@@ -61,6 +64,10 @@ const AgentCheckMessagesSchema = z.object({
 const AgentHeartbeatSchema = z.object({
   agent_id: z.string(),
   status: z.string().optional().default("active"),
+});
+
+const AgentDiscoverSchema = z.object({
+  include_stale: z.boolean().optional().default(false),
 });
 
 const tools: Tool[] = [
@@ -188,6 +195,16 @@ const tools: Tool[] = [
       required: ["agent_id"],
     },
   },
+  {
+    name: "nats_agent_discover",
+    description: "Discover all active agents. Returns list of registered agents with their IDs, names, and status.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        include_stale: { type: "boolean" as const, description: "Include agents not seen in last 5 minutes" },
+      },
+    },
+  },
 ];
 
 async function runNatsCommand(args: string[]): Promise<string> {
@@ -307,26 +324,35 @@ async function agentDM(args: z.infer<typeof AgentDMSchema>): Promise<string> {
 }
 
 async function agentCheckMessages(args: z.infer<typeof AgentCheckMessagesSchema>): Promise<string> {
-  const timeout = args.timeout || 5000;
-  // Subscribe to both DMs and broadcasts
-  const dmSubject = `agents.dm.${args.agent_id}`;
-  const broadcastSubject = "agents.broadcast";
+  const consumerName = `agent-${args.agent_id.replace(/\//g, "-")}`;
+  const streamName = "AGENT_MESSAGES";
 
-  // Run two subscribes in parallel
-  const [dms, broadcasts] = await Promise.all([
-    subscribe({ subject: dmSubject, count: 10, timeout }),
-    subscribe({ subject: broadcastSubject, count: 10, timeout }),
-  ]);
+  // Pull messages from JetStream consumer
+  const cmdArgs = [
+    "consumer", "next",
+    streamName, consumerName,
+    "--count", "10",
+    "--no-ack", // We'll format and return, let caller decide to ack
+  ];
 
-  const messages: string[] = [];
-  if (dms && dms !== "No messages" && dms !== "No messages received") {
-    messages.push(`[DMs]\n${dms}`);
+  try {
+    const result = await runNatsCommand(cmdArgs);
+    if (!result || result === "OK" || result.includes("no messages")) {
+      return "No messages";
+    }
+    return result;
+  } catch (error) {
+    // Consumer might not exist or no messages
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.includes("timeout") || msg.includes("no messages")) {
+      return "No messages";
+    }
+    // Consumer doesn't exist - try creating it
+    if (msg.includes("consumer not found") || msg.includes("not found")) {
+      return "No messages (consumer not configured)";
+    }
+    throw error;
   }
-  if (broadcasts && broadcasts !== "No messages" && broadcasts !== "No messages received") {
-    messages.push(`[Broadcasts]\n${broadcasts}`);
-  }
-
-  return messages.length > 0 ? messages.join("\n\n") : "No messages";
 }
 
 async function agentHeartbeat(args: z.infer<typeof AgentHeartbeatSchema>): Promise<string> {
@@ -337,6 +363,70 @@ async function agentHeartbeat(args: z.infer<typeof AgentHeartbeatSchema>): Promi
   });
   await publish({ subject: `agents.heartbeat.${args.agent_id}`, message: payload });
   return "Heartbeat sent";
+}
+
+async function agentDiscover(args: z.infer<typeof AgentDiscoverSchema>): Promise<string> {
+  const agentDir = "/tmp";
+  const staleThreshold = 5 * 60 * 1000; // 5 minutes
+  const now = Date.now();
+
+  interface AgentInfo {
+    id: string;
+    name: string;
+    status: string;
+    tmux_pane: string;
+    registered_at: string;
+    is_stale: boolean;
+  }
+
+  const agents: AgentInfo[] = [];
+
+  try {
+    const files = readdirSync(agentDir).filter(f => f.startsWith("claude_agent_") && f.endsWith(".json"));
+
+    for (const file of files) {
+      try {
+        const filePath = join(agentDir, file);
+        const stat = statSync(filePath);
+        const content = readFileSync(filePath, "utf-8");
+        const data = JSON.parse(content);
+
+        // Check if stale (file not modified in last 5 minutes)
+        const fileAge = now - stat.mtimeMs;
+        const isStale = fileAge > staleThreshold;
+
+        if (!args.include_stale && isStale) {
+          continue;
+        }
+
+        agents.push({
+          id: data.agent_id || "unknown",
+          name: data.agent_name || "unknown",
+          status: isStale ? "stale" : "active",
+          tmux_pane: data.tmux_session && data.tmux_window && data.tmux_pane
+            ? `${data.tmux_session}:${data.tmux_window}.${data.tmux_pane}`
+            : "unknown",
+          registered_at: data.registered_at || "unknown",
+          is_stale: isStale,
+        });
+      } catch {
+        // Skip invalid files
+      }
+    }
+  } catch {
+    // Directory read failed
+  }
+
+  if (agents.length === 0) {
+    return "No agents currently registered.";
+  }
+
+  // Format output
+  const lines = agents.map(a =>
+    `- ${a.name} (${a.id}): ${a.status} | pane: ${a.tmux_pane}`
+  );
+
+  return `Active agents (${agents.length}):\n${lines.join("\n")}`;
 }
 
 const server = new Server(
@@ -379,6 +469,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         break;
       case "nats_agent_heartbeat":
         result = await agentHeartbeat(AgentHeartbeatSchema.parse(args));
+        break;
+      case "nats_agent_discover":
+        result = await agentDiscover(AgentDiscoverSchema.parse(args));
         break;
       default:
         throw new Error(`Unknown tool: ${name}`);
