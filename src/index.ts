@@ -11,9 +11,16 @@ import {
 import { spawn } from "child_process";
 import { randomBytes } from "crypto";
 import { z } from "zod";
+import { appendFileSync } from "fs";
 import * as db from "./db.js";
 
 const SND_PATH = process.env.SND_PATH || "/home/decoder/.claude/scripts/snd";
+const LOG_FILE = "/tmp/agent_messages.log";
+
+function logToFile(type: string, content: string): void {
+  const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  appendFileSync(LOG_FILE, `[${ts}] [${type}] ${content}\n`);
+}
 
 // Tool schemas
 const AgentRegisterSchema = z.object({
@@ -222,6 +229,7 @@ async function agentBroadcast(args: z.infer<typeof AgentBroadcastSchema>): Promi
   }
 
   await db.logMessage("BROADCAST", args.agent_id, null, null, args.message);
+  logToFile("BROADCAST", `${senderName}: ${args.message}`);
 
   const formattedMsg = `[${senderName}] ${args.message}`;
   const results: string[] = [];
@@ -250,6 +258,7 @@ async function agentDM(args: z.infer<typeof AgentDMSchema>): Promise<string> {
   if (!target.pane_id) return `Agent ${args.to} has no tmux pane`;
 
   await db.logMessage("DM", args.agent_id, args.to, null, args.message);
+  logToFile("DM", `${senderName} -> ${target.name}: ${args.message}`);
 
   const formattedMsg = `[DM from ${senderName}] ${args.message}`;
 
