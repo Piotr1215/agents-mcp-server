@@ -13,14 +13,21 @@
     "test": "vitest run",
     "test:watch": "vitest"
   },
-  "keywords": ["mcp", "nats", "messaging", "claude", "ai"],
+  "keywords": [
+    "mcp",
+    "nats",
+    "messaging",
+    "claude",
+    "ai"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Piotr1215/nats-mcp-server.git"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "duckdb-async": "^1.4.2"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
