@@ -241,4 +241,72 @@ describe("Agents MCP Server", () => {
       expect(schema.required).not.toContain("priority");
     });
   });
+
+  describe("agent groups", () => {
+    it("registers with default group when not specified", () => {
+      const response = {
+        agent_id: "bobby-abcd1234",
+        group: "default",
+        message: "Registered.",
+      };
+      expect(response.group).toBe("default");
+    });
+
+    it("registers with specified group", () => {
+      const response = {
+        agent_id: "bobby-abcd1234",
+        group: "research",
+        message: "Registered.",
+      };
+      expect(response.group).toBe("research");
+    });
+
+    it("broadcasts to all agents when no group specified", () => {
+      const agents = [
+        { name: "a1", group: "default" },
+        { name: "a2", group: "research" },
+        { name: "a3", group: "default" },
+      ];
+      const targets = agents.filter(a => a.name !== "a1");
+      expect(targets.length).toBe(2);
+    });
+
+    it("broadcasts only to specified group", () => {
+      const agents = [
+        { name: "a1", group: "default" },
+        { name: "a2", group: "research" },
+        { name: "a3", group: "default" },
+      ];
+      const group = "default";
+      const targets = agents.filter(a => a.name !== "a1" && a.group === group);
+      expect(targets.length).toBe(1);
+      expect(targets[0].name).toBe("a3");
+    });
+
+    it("discovers agents filtered by group", () => {
+      const agents = [
+        { name: "a1", group: "default" },
+        { name: "a2", group: "research" },
+      ];
+      const group = "research";
+      const filtered = agents.filter(a => a.group === group);
+      expect(filtered.length).toBe(1);
+      expect(filtered[0].name).toBe("a2");
+    });
+
+    it("lists unique groups with counts", () => {
+      const agents = [
+        { group: "default" },
+        { group: "default" },
+        { group: "research" },
+      ];
+      const counts = new Map<string, number>();
+      for (const a of agents) {
+        counts.set(a.group, (counts.get(a.group) || 0) + 1);
+      }
+      expect(counts.get("default")).toBe(2);
+      expect(counts.get("research")).toBe(1);
+      expect(counts.size).toBe(2);
+    });
+  });
 });

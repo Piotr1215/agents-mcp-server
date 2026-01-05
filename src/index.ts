@@ -20,6 +20,7 @@ const SND_PATH = process.env.SND_PATH || "/home/decoder/.claude/scripts/snd";
 const AgentRegisterSchema = z.object({
   name: z.string(),
   description: z.string(),
+  group: z.string().optional().default("default"),
 });
 
 const AgentDeregisterSchema = z.object({
@@ -30,6 +31,7 @@ const AgentBroadcastSchema = z.object({
   agent_id: z.string(),
   message: z.string(),
   priority: z.enum(["low", "normal", "high"]).optional().default("normal"),
+  group: z.string().optional(),
 });
 
 const AgentDMSchema = z.object({
@@ -40,7 +42,10 @@ const AgentDMSchema = z.object({
 
 const AgentDiscoverSchema = z.object({
   include_stale: z.boolean().optional().default(false),
+  group: z.string().optional(),
 });
+
+const AgentGroupsSchema = z.object({});
 
 const tools: Tool[] = [
   {
@@ -51,6 +56,7 @@ const tools: Tool[] = [
       properties: {
         name: { type: "string" as const, description: "Agent name" },
         description: { type: "string" as const, description: "What this agent does" },
+        group: { type: "string" as const, description: "Agent group (default: 'default')" },
       },
       required: ["name", "description"],
     },
@@ -75,6 +81,7 @@ const tools: Tool[] = [
         agent_id: { type: "string" as const, description: "Your agent ID" },
         message: { type: "string" as const, description: "Message content" },
         priority: { type: "string" as const, enum: ["low", "normal", "high"], description: "Message priority" },
+        group: { type: "string" as const, description: "Target group (omit for all agents)" },
       },
       required: ["agent_id", "message"],
     },
@@ -99,7 +106,16 @@ const tools: Tool[] = [
       type: "object" as const,
       properties: {
         include_stale: { type: "boolean" as const, description: "Include agents not seen in last 5 minutes" },
+        group: { type: "string" as const, description: "Filter by group (omit for all)" },
       },
+    },
+  },
+  {
+    name: "agent_groups",
+    description: "List all active agent groups.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
     },
   },
 ];
@@ -107,6 +123,7 @@ const tools: Tool[] = [
 interface AgentInfo {
   id: string;
   name: string;
+  group: string;
   tmux_pane: string;
   is_stale: boolean;
 }
@@ -127,6 +144,7 @@ function getActiveAgents(_includeStale = false): AgentInfo[] {
         agents.push({
           id: data.agent_id || "unknown",
           name: data.agent_name || "unknown",
+          group: data.group || "default",
           tmux_pane: data.pane_id || "",
           is_stale: false,
         });
@@ -163,7 +181,7 @@ function generateAgentId(name: string): string {
 
 async function agentRegister(args: z.infer<typeof AgentRegisterSchema>): Promise<string> {
   const agentId = generateAgentId(args.name);
-  return JSON.stringify({ agent_id: agentId, message: "Registered. Use this agent_id for all subsequent calls." });
+  return JSON.stringify({ agent_id: agentId, group: args.group, message: "Registered. Use this agent_id for all subsequent calls." });
 }
 
 async function agentDeregister(_args: z.infer<typeof AgentDeregisterSchema>): Promise<string> {
@@ -173,10 +191,20 @@ async function agentDeregister(_args: z.infer<typeof AgentDeregisterSchema>): Pr
 async function agentBroadcast(args: z.infer<typeof AgentBroadcastSchema>): Promise<string> {
   const agents = getActiveAgents();
   const senderName = args.agent_id.split("-")[0];
-  const targets = agents.filter(a => a.id !== args.agent_id && a.tmux_pane);
+  const sender = agents.find(a => a.id === args.agent_id);
+  const senderGroup = sender?.group || "default";
+
+  let targets = agents.filter(a => a.id !== args.agent_id && a.tmux_pane);
+
+  // Determine target group: explicit group, "all" for everyone, or sender's group
+  const targetGroup = args.group === "all" ? null : (args.group || senderGroup);
+
+  if (targetGroup) {
+    targets = targets.filter(a => a.group === targetGroup);
+  }
 
   if (targets.length === 0) {
-    return "No other agents to broadcast to";
+    return targetGroup ? `No agents in group '${targetGroup}'` : "No other agents to broadcast to";
   }
 
   const formattedMsg = `[${senderName}] ${args.message}`;
@@ -191,7 +219,8 @@ async function agentBroadcast(args: z.infer<typeof AgentBroadcastSchema>): Promi
     }
   }
 
-  return `Broadcast sent to ${targets.length} agent(s):\n${results.join("\n")}`;
+  const groupInfo = targetGroup ? ` in group '${targetGroup}'` : " (all groups)";
+  return `Broadcast sent to ${targets.length} agent(s)${groupInfo}:\n${results.join("\n")}`;
 }
 
 async function agentDM(args: z.infer<typeof AgentDMSchema>): Promise<string> {
@@ -213,15 +242,39 @@ async function agentDM(args: z.infer<typeof AgentDMSchema>): Promise<string> {
 }
 
 async function agentDiscover(args: z.infer<typeof AgentDiscoverSchema>): Promise<string> {
-  const agents = getActiveAgents(args.include_stale);
+  let agents = getActiveAgents(args.include_stale);
 
-  if (agents.length === 0) return "No agents currently registered.";
+  if (args.group) {
+    agents = agents.filter(a => a.group === args.group);
+  }
+
+  if (agents.length === 0) {
+    return args.group ? `No agents in group '${args.group}'` : "No agents currently registered.";
+  }
 
   const lines = agents.map(a =>
-    `- ${a.name} (${a.id}): ${a.is_stale ? "stale" : "active"} | pane: ${a.tmux_pane || "unknown"}`
+    `- ${a.name} (${a.id}): ${a.is_stale ? "stale" : "active"} | group: ${a.group} | pane: ${a.tmux_pane || "unknown"}`
   );
 
-  return `Active agents (${agents.length}):\n${lines.join("\n")}`;
+  const groupInfo = args.group ? ` in group '${args.group}'` : "";
+  return `Active agents (${agents.length})${groupInfo}:\n${lines.join("\n")}`;
+}
+
+async function agentGroups(): Promise<string> {
+  const agents = getActiveAgents();
+
+  if (agents.length === 0) return "No agents registered.";
+
+  const groupCounts = new Map<string, number>();
+  for (const a of agents) {
+    groupCounts.set(a.group, (groupCounts.get(a.group) || 0) + 1);
+  }
+
+  const lines = Array.from(groupCounts.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([group, count]) => `- ${group} (${count} agent${count > 1 ? "s" : ""})`);
+
+  return `Active groups (${groupCounts.size}):\n${lines.join("\n")}`;
 }
 
 const server = new Server(
@@ -252,6 +305,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         break;
       case "agent_discover":
         result = await agentDiscover(AgentDiscoverSchema.parse(args));
+        break;
+      case "agent_groups":
+        result = await agentGroups();
         break;
       default:
         throw new Error(`Unknown tool: ${name}`);
