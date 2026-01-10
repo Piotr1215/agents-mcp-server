@@ -64,6 +64,14 @@ const ChannelHistorySchema = z.object({
   limit: z.number().optional().default(50),
 });
 
+const DmHistorySchema = z.object({
+  agent_id: z.string(),
+  with_agent: z.string(),
+  limit: z.number().optional().default(50),
+});
+
+const ChannelListSchema = z.object({});
+
 const MessagesSinceSchema = z.object({
   since_id: z.number().optional().default(0),
   limit: z.number().optional().default(100),
@@ -166,6 +174,27 @@ const tools: Tool[] = [
     },
   },
   {
+    name: "dm_history",
+    description: "Get DM history between you and another agent.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        agent_id: { type: "string" as const, description: "Your agent ID" },
+        with_agent: { type: "string" as const, description: "The other agent's ID or name" },
+        limit: { type: "number" as const, description: "Max messages to return (default: 50)" },
+      },
+      required: ["agent_id", "with_agent"],
+    },
+  },
+  {
+    name: "channel_list",
+    description: "List all channels with message counts.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
     name: "messages_since",
     description: "Poll for new messages since a given ID (for TUI).",
     inputSchema: {
@@ -252,7 +281,12 @@ async function agentBroadcast(args: z.infer<typeof AgentBroadcastSchema>): Promi
 async function agentDM(args: z.infer<typeof AgentDMSchema>): Promise<string> {
   const sender = await db.getAgent(args.agent_id);
   const senderName = sender?.name || args.agent_id.split("-")[0];
-  const target = await db.getAgent(args.to);
+
+  // Try full ID first, then fallback to name lookup (short ID resolution)
+  let target = await db.getAgent(args.to);
+  if (!target) {
+    target = await db.getAgentByName(args.to);
+  }
 
   if (!target) return `Agent ${args.to} not found`;
   if (!target.pane_id) return `Agent ${args.to} has no tmux pane`;
@@ -333,6 +367,37 @@ async function channelHistory(args: z.infer<typeof ChannelHistorySchema>): Promi
   return `#${args.channel} history (${messages.length}):\n${lines.join("\n")}`;
 }
 
+async function dmHistory(args: z.infer<typeof DmHistorySchema>): Promise<string> {
+  // Resolve with_agent - try full ID first, then name
+  let otherAgent = await db.getAgent(args.with_agent);
+  if (!otherAgent) {
+    otherAgent = await db.getAgentByName(args.with_agent);
+  }
+  const otherId = otherAgent?.id || args.with_agent;
+  const otherName = otherAgent?.name || args.with_agent.split("-")[0];
+
+  const messages = await db.getDmHistory(args.agent_id, otherId, args.limit);
+
+  if (messages.length === 0) return `No DM history with ${otherName}`;
+
+  const lines = messages.reverse().map(m => {
+    const ts = new Date(m.timestamp).toLocaleTimeString();
+    const from = m.from_agent?.split("-")[0] || "unknown";
+    return `[${ts}] ${from}: ${m.content}`;
+  });
+
+  return `DM history with ${otherName} (${messages.length}):\n${lines.join("\n")}`;
+}
+
+async function channelList(): Promise<string> {
+  const channels = await db.getChannels();
+
+  if (channels.length === 0) return "No channels with messages yet.";
+
+  const lines = channels.map(c => `- #${c.channel} (${c.message_count} messages)`);
+  return `Active channels (${channels.length}):\n${lines.join("\n")}`;
+}
+
 async function messagesSince(args: z.infer<typeof MessagesSinceSchema>): Promise<string> {
   const messages = await db.getMessagesSince(args.since_id, args.limit);
 
@@ -379,6 +444,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         break;
       case "channel_history":
         result = await channelHistory(ChannelHistorySchema.parse(args));
+        break;
+      case "dm_history":
+        result = await dmHistory(DmHistorySchema.parse(args));
+        break;
+      case "channel_list":
+        result = await channelList();
         break;
       case "messages_since":
         result = await messagesSince(MessagesSinceSchema.parse(args));

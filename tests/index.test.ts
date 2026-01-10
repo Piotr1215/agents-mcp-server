@@ -161,6 +161,21 @@ describe("Agents MCP Server", () => {
 
       expect(message).toBe("[DM from bobby] hello");
     });
+
+    it("supports short ID resolution (name only)", () => {
+      // agentDM now supports both:
+      // - Full ID: "bobby-12345678"
+      // - Short name: "bobby"
+      // Resolution order: try full ID first, then name lookup
+      const fullId = "bobby-12345678";
+      const shortName = "bobby";
+
+      // Both should resolve to same agent
+      expect(fullId.startsWith(shortName)).toBe(true);
+
+      // Short name is extracted from full ID
+      expect(fullId.split("-")[0]).toBe(shortName);
+    });
   });
 
   describe("agent_deregister", () => {

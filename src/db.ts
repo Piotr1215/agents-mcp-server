@@ -129,6 +129,13 @@ export async function getChannelHistory(channel: string, limit = 50): Promise<Me
   return JSON.parse(result || "[]") as Message[];
 }
 
+export async function getDmHistory(agent1: string, agent2: string, limit = 50): Promise<Message[]> {
+  initSchema();
+  // Get DMs between two agents (both directions)
+  const result = dbQuery(`SELECT * FROM messages WHERE type = 'DM' AND ((from_agent = '${agent1}' AND to_agent = '${agent2}') OR (from_agent = '${agent2}' AND to_agent = '${agent1}')) ORDER BY timestamp DESC LIMIT ${limit}`);
+  return JSON.parse(result || "[]") as Message[];
+}
+
 export async function getMessagesSince(sinceId: number, limit = 100): Promise<Message[]> {
   initSchema();
   const result = dbQuery(`SELECT * FROM messages WHERE id > ${sinceId} ORDER BY id ASC LIMIT ${limit}`);
@@ -139,4 +146,10 @@ export async function getGroups(): Promise<{group_name: string, count: number}[]
   initSchema();
   const result = dbQuery(`SELECT group_name, COUNT(*) as count FROM agents GROUP BY group_name ORDER BY group_name`);
   return JSON.parse(result || "[]") as {group_name: string, count: number}[];
+}
+
+export async function getChannels(): Promise<{channel: string, message_count: number}[]> {
+  initSchema();
+  const result = dbQuery(`SELECT channel, COUNT(*) as message_count FROM messages WHERE channel IS NOT NULL GROUP BY channel ORDER BY channel`);
+  return JSON.parse(result || "[]") as {channel: string, message_count: number}[];
 }
