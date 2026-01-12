@@ -242,8 +242,9 @@ async function agentDeregister(args: z.infer<typeof AgentDeregisterSchema>): Pro
 
 async function agentBroadcast(args: z.infer<typeof AgentBroadcastSchema>): Promise<string> {
   const sender = await db.getAgent(args.agent_id);
-  const senderName = sender?.name || args.agent_id.split("-")[0];
-  const senderGroup = sender?.group_name || "default";
+  if (!sender) return `Sender ${args.agent_id} not registered. Registration may have failed (pane collision?).`;
+  const senderName = sender.name;
+  const senderGroup = sender.group_name;
 
   let agents = await db.getAgents();
   let targets = agents.filter(a => a.id !== args.agent_id && a.pane_id);
@@ -280,7 +281,8 @@ async function agentBroadcast(args: z.infer<typeof AgentBroadcastSchema>): Promi
 
 async function agentDM(args: z.infer<typeof AgentDMSchema>): Promise<string> {
   const sender = await db.getAgent(args.agent_id);
-  const senderName = sender?.name || args.agent_id.split("-")[0];
+  if (!sender) return `Sender ${args.agent_id} not registered. Registration may have failed (pane collision?).`;
+  const senderName = sender.name;
 
   // Try full ID first, then fallback to name lookup (short ID resolution)
   let target = await db.getAgent(args.to);
