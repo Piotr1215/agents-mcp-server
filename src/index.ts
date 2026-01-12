@@ -227,6 +227,11 @@ function generateAgentId(name: string): string {
 
 // Note: pane_id comes from PostToolUse hook, not from here
 async function agentRegister(args: z.infer<typeof AgentRegisterSchema>): Promise<string> {
+  // Check if agent with same name already exists - reuse ID to prevent orphaning
+  const existing = await db.getAgentByName(args.name);
+  if (existing) {
+    return JSON.stringify({ agent_id: existing.id, group: args.group, message: "Registered. Use this agent_id for all subsequent calls." });
+  }
   const agentId = generateAgentId(args.name);
   // Registration completed by hook which calls registerAgent with pane_id
   return JSON.stringify({ agent_id: agentId, group: args.group, message: "Registered. Use this agent_id for all subsequent calls." });
@@ -241,7 +246,12 @@ async function agentDeregister(args: z.infer<typeof AgentDeregisterSchema>): Pro
 }
 
 async function agentBroadcast(args: z.infer<typeof AgentBroadcastSchema>): Promise<string> {
-  const sender = await db.getAgent(args.agent_id);
+  // Try ID first, fallback to name (handles re-registration with new ID)
+  let sender = await db.getAgent(args.agent_id);
+  if (!sender) {
+    const name = args.agent_id.split("-").slice(0, -1).join("-");
+    sender = await db.getAgentByName(name);
+  }
   if (!sender) return `Sender ${args.agent_id} not registered. Registration may have failed (pane collision?).`;
   const senderName = sender.name;
   const senderGroup = sender.group_name;
@@ -280,7 +290,12 @@ async function agentBroadcast(args: z.infer<typeof AgentBroadcastSchema>): Promi
 }
 
 async function agentDM(args: z.infer<typeof AgentDMSchema>): Promise<string> {
-  const sender = await db.getAgent(args.agent_id);
+  // Try ID first, fallback to name (handles re-registration with new ID)
+  let sender = await db.getAgent(args.agent_id);
+  if (!sender) {
+    const name = args.agent_id.split("-").slice(0, -1).join("-");
+    sender = await db.getAgentByName(name);
+  }
   if (!sender) return `Sender ${args.agent_id} not registered. Registration may have failed (pane collision?).`;
   const senderName = sender.name;
 
@@ -331,8 +346,13 @@ async function agentGroups(): Promise<string> {
 }
 
 async function channelSend(args: z.infer<typeof ChannelSendSchema>): Promise<string> {
-  const sender = await db.getAgent(args.agent_id);
-  const senderName = sender?.name || args.agent_id.split("-")[0];
+  // Try ID first, fallback to name (handles re-registration with new ID)
+  let sender = await db.getAgent(args.agent_id);
+  if (!sender) {
+    const name = args.agent_id.split("-").slice(0, -1).join("-");
+    sender = await db.getAgentByName(name);
+  }
+  const senderName = sender?.name || args.agent_id.split("-").slice(0, -1).join("-");
 
   await db.logMessage("CHANNEL", args.agent_id, null, args.channel, args.message);
 
