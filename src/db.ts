@@ -6,6 +6,11 @@ const DB_PATH = process.env.AGENTS_DB_PATH || "/home/decoder/.claude/data/agents
 
 let initialized = false;
 
+// Escape string for SQL single-quoted literals
+function esc(value: string): string {
+  return value.replace(/'/g, "''").replace(/\\/g, "\\\\");
+}
+
 function dbQuery(sql: string): string {
   try {
     return execSync(`duckdb "${DB_PATH}" -json -c "${sql.replace(/"/g, '\\"')}"`, {
@@ -13,6 +18,7 @@ function dbQuery(sql: string): string {
       timeout: 5000,
     }).trim();
   } catch (e) {
+    console.error("[db] Query failed:", e);
     return "[]";
   }
 }
@@ -23,8 +29,8 @@ function dbExec(sql: string): void {
       encoding: "utf-8",
       timeout: 5000,
     });
-  } catch {
-    // Ignore errors
+  } catch (e) {
+    console.error("[db] Exec failed:", e);
   }
 }
 
@@ -47,7 +53,17 @@ function initSchema(): void {
       channel VARCHAR,
       content TEXT
     );
+    CREATE TABLE IF NOT EXISTS tool_metrics (
+      id INTEGER PRIMARY KEY,
+      timestamp TIMESTAMP DEFAULT now(),
+      tool_name VARCHAR NOT NULL,
+      response_chars INTEGER NOT NULL,
+      response_lines INTEGER NOT NULL,
+      duration_ms INTEGER,
+      is_error BOOLEAN DEFAULT false
+    );
     CREATE SEQUENCE IF NOT EXISTS msg_seq START 1;
+    CREATE SEQUENCE IF NOT EXISTS metric_seq START 1;
   `);
   initialized = true;
 }
@@ -77,15 +93,15 @@ export interface Message {
 
 export async function registerAgent(id: string, name: string, group: string, paneId: string): Promise<void> {
   initSchema();
-  dbExec(`INSERT OR REPLACE INTO agents (id, name, group_name, pane_id, registered_at) VALUES ('${id}', '${name}', '${group}', '${paneId}', now())`);
+  dbExec(`INSERT OR REPLACE INTO agents (id, name, group_name, pane_id, registered_at) VALUES ('${esc(id)}', '${esc(name)}', '${esc(group)}', '${esc(paneId)}', now())`);
 }
 
 export async function deregisterAgent(id: string): Promise<Agent | null> {
   initSchema();
-  const result = dbQuery(`SELECT * FROM agents WHERE id = '${id}'`);
+  const result = dbQuery(`SELECT * FROM agents WHERE id = '${esc(id)}'`);
   const rows = JSON.parse(result || "[]");
   if (rows.length > 0) {
-    dbExec(`DELETE FROM agents WHERE id = '${id}'`);
+    dbExec(`DELETE FROM agents WHERE id = '${esc(id)}'`);
     return rows[0] as Agent;
   }
   return null;
@@ -94,7 +110,7 @@ export async function deregisterAgent(id: string): Promise<Agent | null> {
 export async function getAgents(group?: string): Promise<Agent[]> {
   initSchema();
   const sql = group
-    ? `SELECT * FROM agents WHERE group_name = '${group}'`
+    ? `SELECT * FROM agents WHERE group_name = '${esc(group)}'`
     : `SELECT * FROM agents`;
   const result = dbQuery(sql);
   return JSON.parse(result || "[]") as Agent[];
@@ -102,14 +118,14 @@ export async function getAgents(group?: string): Promise<Agent[]> {
 
 export async function getAgent(id: string): Promise<Agent | null> {
   initSchema();
-  const result = dbQuery(`SELECT * FROM agents WHERE id = '${id}'`);
+  const result = dbQuery(`SELECT * FROM agents WHERE id = '${esc(id)}'`);
   const rows = JSON.parse(result || "[]");
   return rows[0] as Agent || null;
 }
 
 export async function getAgentByName(name: string): Promise<Agent | null> {
   initSchema();
-  const result = dbQuery(`SELECT * FROM agents WHERE name = '${name}'`);
+  const result = dbQuery(`SELECT * FROM agents WHERE name = '${esc(name)}'`);
   const rows = JSON.parse(result || "[]");
   return rows[0] as Agent || null;
 }
@@ -118,21 +134,19 @@ export async function logMessage(type: string, from: string | null, to: string |
   initSchema();
   const idResult = dbQuery(`SELECT nextval('msg_seq') as id`);
   const id = JSON.parse(idResult || "[{\"id\":1}]")[0].id;
-  const escapedContent = content.replace(/'/g, "''");
-  dbExec(`INSERT INTO messages (id, type, from_agent, to_agent, channel, content) VALUES (${id}, '${type}', ${from ? `'${from}'` : 'NULL'}, ${to ? `'${to}'` : 'NULL'}, ${channel ? `'${channel}'` : 'NULL'}, '${escapedContent}')`);
+  dbExec(`INSERT INTO messages (id, type, from_agent, to_agent, channel, content) VALUES (${id}, '${esc(type)}', ${from ? `'${esc(from)}'` : 'NULL'}, ${to ? `'${esc(to)}'` : 'NULL'}, ${channel ? `'${esc(channel)}'` : 'NULL'}, '${esc(content)}')`);
   return id;
 }
 
 export async function getChannelHistory(channel: string, limit = 50): Promise<Message[]> {
   initSchema();
-  const result = dbQuery(`SELECT * FROM messages WHERE channel = '${channel}' ORDER BY timestamp DESC LIMIT ${limit}`);
+  const result = dbQuery(`SELECT * FROM messages WHERE channel = '${esc(channel)}' ORDER BY timestamp DESC LIMIT ${limit}`);
   return JSON.parse(result || "[]") as Message[];
 }
 
 export async function getDmHistory(agent1: string, agent2: string, limit = 50): Promise<Message[]> {
   initSchema();
-  // Get DMs between two agents (both directions)
-  const result = dbQuery(`SELECT * FROM messages WHERE type = 'DM' AND ((from_agent = '${agent1}' AND to_agent = '${agent2}') OR (from_agent = '${agent2}' AND to_agent = '${agent1}')) ORDER BY timestamp DESC LIMIT ${limit}`);
+  const result = dbQuery(`SELECT * FROM messages WHERE type = 'DM' AND ((from_agent = '${esc(agent1)}' AND to_agent = '${esc(agent2)}') OR (from_agent = '${esc(agent2)}' AND to_agent = '${esc(agent1)}')) ORDER BY timestamp DESC LIMIT ${limit}`);
   return JSON.parse(result || "[]") as Message[];
 }
 
@@ -152,4 +166,44 @@ export async function getChannels(): Promise<{channel: string, message_count: nu
   initSchema();
   const result = dbQuery(`SELECT channel, COUNT(*) as message_count FROM messages WHERE channel IS NOT NULL GROUP BY channel ORDER BY channel`);
   return JSON.parse(result || "[]") as {channel: string, message_count: number}[];
+}
+
+export interface ToolMetric {
+  id: number;
+  timestamp: Date;
+  tool_name: string;
+  response_chars: number;
+  response_lines: number;
+  duration_ms: number | null;
+  is_error: boolean;
+}
+
+export async function logToolMetric(toolName: string, responseChars: number, responseLines: number, durationMs: number | null, isError: boolean): Promise<void> {
+  initSchema();
+  const idResult = dbQuery(`SELECT nextval('metric_seq') as id`);
+  const id = JSON.parse(idResult || "[{\"id\":1}]")[0].id;
+  dbExec(`INSERT INTO tool_metrics (id, tool_name, response_chars, response_lines, duration_ms, is_error) VALUES (${id}, '${esc(toolName)}', ${responseChars}, ${responseLines}, ${durationMs ?? 'NULL'}, ${isError})`);
+}
+
+export async function getToolMetrics(days = 7): Promise<ToolMetric[]> {
+  initSchema();
+  const result = dbQuery(`SELECT * FROM tool_metrics WHERE timestamp > now() - INTERVAL '${days} days' ORDER BY timestamp DESC`);
+  return JSON.parse(result || "[]") as ToolMetric[];
+}
+
+export async function getToolMetricsSummary(days = 7): Promise<{tool_name: string, call_count: number, avg_chars: number, total_chars: number, error_count: number}[]> {
+  initSchema();
+  const result = dbQuery(`
+    SELECT
+      tool_name,
+      COUNT(*) as call_count,
+      ROUND(AVG(response_chars))::INTEGER as avg_chars,
+      SUM(response_chars) as total_chars,
+      SUM(CASE WHEN is_error THEN 1 ELSE 0 END) as error_count
+    FROM tool_metrics
+    WHERE timestamp > now() - INTERVAL '${days} days'
+    GROUP BY tool_name
+    ORDER BY total_chars DESC
+  `);
+  return JSON.parse(result || "[]") as {tool_name: string, call_count: number, avg_chars: number, total_chars: number, error_count: number}[];
 }

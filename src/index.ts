@@ -30,18 +30,18 @@ const AgentRegisterSchema = z.object({
 });
 
 const AgentDeregisterSchema = z.object({
-  agent_id: z.string(),
+  name: z.string(),
 });
 
 const AgentBroadcastSchema = z.object({
-  agent_id: z.string(),
+  name: z.string(),
   message: z.string(),
   priority: z.enum(["low", "normal", "high"]).optional().default("normal"),
   group: z.string().optional(),
 });
 
 const AgentDMSchema = z.object({
-  agent_id: z.string(),
+  name: z.string(),
   to: z.string(),
   message: z.string(),
 });
@@ -54,7 +54,7 @@ const AgentDiscoverSchema = z.object({
 const AgentGroupsSchema = z.object({});
 
 const ChannelSendSchema = z.object({
-  agent_id: z.string(),
+  name: z.string(),
   channel: z.string(),
   message: z.string(),
 });
@@ -62,12 +62,14 @@ const ChannelSendSchema = z.object({
 const ChannelHistorySchema = z.object({
   channel: z.string(),
   limit: z.number().optional().default(50),
+  detailed: z.boolean().optional().default(false),
 });
 
 const DmHistorySchema = z.object({
-  agent_id: z.string(),
+  name: z.string(),
   with_agent: z.string(),
   limit: z.number().optional().default(50),
+  detailed: z.boolean().optional().default(false),
 });
 
 const ChannelListSchema = z.object({});
@@ -77,10 +79,14 @@ const MessagesSinceSchema = z.object({
   limit: z.number().optional().default(100),
 });
 
+const ToolMetricsSchema = z.object({
+  days: z.number().optional().default(7),
+});
+
 const tools: Tool[] = [
   {
     name: "agent_register",
-    description: "Register as an agent. Returns unique agent_id to use in other calls.",
+    description: "Register as an agent. Returns agent_id and list of active peers in your group.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -90,6 +96,7 @@ const tools: Tool[] = [
       },
       required: ["name", "description"],
     },
+    annotations: { title: "Join Conversation", readOnlyHint: false },
   },
   {
     name: "agent_deregister",
@@ -97,10 +104,11 @@ const tools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        agent_id: { type: "string" as const, description: "Your agent ID from registration" },
+        name: { type: "string" as const, description: "Your agent name" },
       },
-      required: ["agent_id"],
+      required: ["name"],
     },
+    annotations: { title: "Leave Conversation", destructiveHint: true },
   },
   {
     name: "agent_broadcast",
@@ -108,13 +116,14 @@ const tools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        agent_id: { type: "string" as const, description: "Your agent ID" },
+        name: { type: "string" as const, description: "Your agent name" },
         message: { type: "string" as const, description: "Message content" },
         priority: { type: "string" as const, enum: ["low", "normal", "high"], description: "Message priority" },
         group: { type: "string" as const, description: "Target group (omit for all agents)" },
       },
-      required: ["agent_id", "message"],
+      required: ["name", "message"],
     },
+    annotations: { title: "Broadcast Message", readOnlyHint: false },
   },
   {
     name: "agent_dm",
@@ -122,12 +131,13 @@ const tools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        agent_id: { type: "string" as const, description: "Your agent ID" },
-        to: { type: "string" as const, description: "Target agent ID" },
+        name: { type: "string" as const, description: "Your agent name" },
+        to: { type: "string" as const, description: "Target agent name" },
         message: { type: "string" as const, description: "Message content" },
       },
-      required: ["agent_id", "to", "message"],
+      required: ["name", "to", "message"],
     },
+    annotations: { title: "Direct Message", readOnlyHint: false },
   },
   {
     name: "agent_discover",
@@ -139,6 +149,7 @@ const tools: Tool[] = [
         group: { type: "string" as const, description: "Filter by group (omit for all)" },
       },
     },
+    annotations: { title: "Find Peers", readOnlyHint: true },
   },
   {
     name: "agent_groups",
@@ -147,6 +158,7 @@ const tools: Tool[] = [
       type: "object" as const,
       properties: {},
     },
+    annotations: { title: "List Groups", readOnlyHint: true },
   },
   {
     name: "channel_send",
@@ -154,12 +166,13 @@ const tools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        agent_id: { type: "string" as const, description: "Your agent ID" },
+        name: { type: "string" as const, description: "Your agent name" },
         channel: { type: "string" as const, description: "Channel name" },
         message: { type: "string" as const, description: "Message content" },
       },
-      required: ["agent_id", "channel", "message"],
+      required: ["name", "channel", "message"],
     },
+    annotations: { title: "Post to Channel", readOnlyHint: false },
   },
   {
     name: "channel_history",
@@ -169,9 +182,11 @@ const tools: Tool[] = [
       properties: {
         channel: { type: "string" as const, description: "Channel name" },
         limit: { type: "number" as const, description: "Max messages to return (default: 50)" },
+        detailed: { type: "boolean" as const, description: "Include full metadata (default: false, compact mode)" },
       },
       required: ["channel"],
     },
+    annotations: { title: "Read Channel", readOnlyHint: true },
   },
   {
     name: "dm_history",
@@ -179,12 +194,14 @@ const tools: Tool[] = [
     inputSchema: {
       type: "object" as const,
       properties: {
-        agent_id: { type: "string" as const, description: "Your agent ID" },
-        with_agent: { type: "string" as const, description: "The other agent's ID or name" },
+        name: { type: "string" as const, description: "Your agent name" },
+        with_agent: { type: "string" as const, description: "The other agent's name" },
         limit: { type: "number" as const, description: "Max messages to return (default: 50)" },
+        detailed: { type: "boolean" as const, description: "Include full metadata (default: false, compact mode)" },
       },
-      required: ["agent_id", "with_agent"],
+      required: ["name", "with_agent"],
     },
+    annotations: { title: "Catch Up on DMs", readOnlyHint: true },
   },
   {
     name: "channel_list",
@@ -193,6 +210,7 @@ const tools: Tool[] = [
       type: "object" as const,
       properties: {},
     },
+    annotations: { title: "List Channels", readOnlyHint: true },
   },
   {
     name: "messages_since",
@@ -204,6 +222,18 @@ const tools: Tool[] = [
         limit: { type: "number" as const, description: "Max messages to return (default: 100)" },
       },
     },
+    annotations: { title: "Poll Messages", readOnlyHint: true },
+  },
+  {
+    name: "tool_metrics",
+    description: "Get tool usage metrics (response sizes, call counts) for optimization analysis.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        days: { type: "number" as const, description: "Days to look back (default: 7)" },
+      },
+    },
+    annotations: { title: "Usage Metrics", readOnlyHint: true },
   },
 ];
 
@@ -229,35 +259,43 @@ function generateAgentId(name: string): string {
 async function agentRegister(args: z.infer<typeof AgentRegisterSchema>): Promise<string> {
   // Check if agent with same name already exists - reuse ID to prevent orphaning
   const existing = await db.getAgentByName(args.name);
-  if (existing) {
-    return JSON.stringify({ agent_id: existing.id, group: args.group, message: "Registered. Use this agent_id for all subsequent calls." });
-  }
-  const agentId = generateAgentId(args.name);
+  const agentId = existing ? existing.id : generateAgentId(args.name);
+
+  // Get active peers so agent knows who's around (one tool = one story)
+  const allAgents = await db.getAgents(args.group);
+  const peers = allAgents
+    .filter(a => a.name !== args.name)
+    .map(a => ({ name: a.name, group: a.group_name }));
+
   // Registration completed by hook which calls registerAgent with pane_id
-  return JSON.stringify({ agent_id: agentId, group: args.group, message: "Registered. Use this agent_id for all subsequent calls." });
+  return JSON.stringify({
+    agent_id: agentId,
+    group: args.group,
+    peers,
+    message: "Registered. Use your name for subsequent calls."
+  });
 }
 
 async function agentDeregister(args: z.infer<typeof AgentDeregisterSchema>): Promise<string> {
-  const agent = await db.deregisterAgent(args.agent_id);
-  if (agent) {
-    await db.logMessage("LEFT", args.agent_id, null, null, `${agent.name} left (group: ${agent.group_name})`);
+  const agent = await db.getAgentByName(args.name);
+  if (!agent || !agent.id) {
+    // Idempotent - already gone is success
+    return `${args.name} deregistered (was already gone or never registered)`;
   }
-  return "Deregistered";
+  await db.deregisterAgent(agent.id);
+  await db.logMessage("LEFT", agent.id, null, null, `${agent.name} left (group: ${agent.group_name})`);
+  return `Deregistered ${args.name}`;
 }
 
 async function agentBroadcast(args: z.infer<typeof AgentBroadcastSchema>): Promise<string> {
-  // Try ID first, fallback to name (handles re-registration with new ID)
-  let sender = await db.getAgent(args.agent_id);
-  if (!sender) {
-    const name = args.agent_id.split("-").slice(0, -1).join("-");
-    sender = await db.getAgentByName(name);
+  const sender = await db.getAgentByName(args.name);
+  if (!sender || !sender.id) {
+    return `Error: You (${args.name}) not registered or registration incomplete. Call agent_register(name, description) first, then wait a moment for hook to complete.`;
   }
-  if (!sender) return `Sender ${args.agent_id} not registered. Registration may have failed (pane collision?).`;
-  const senderName = sender.name;
-  const senderGroup = sender.group_name;
+  const senderGroup = sender.group_name || "default";
 
   let agents = await db.getAgents();
-  let targets = agents.filter(a => a.id !== args.agent_id && a.pane_id);
+  let targets = agents.filter(a => a.name !== args.name && a.pane_id);
 
   const targetGroup = args.group === "all" ? null : (args.group || senderGroup);
   if (targetGroup) {
@@ -265,13 +303,17 @@ async function agentBroadcast(args: z.infer<typeof AgentBroadcastSchema>): Promi
   }
 
   if (targets.length === 0) {
-    return targetGroup ? `No agents in group '${targetGroup}'` : "No other agents to broadcast to";
+    const allAgents = await db.getAgents();
+    const groups = [...new Set(allAgents.map(a => a.group_name))];
+    return targetGroup
+      ? `Error: No agents in group '${targetGroup}'. Available groups: ${groups.join(", ")}. Use agent_discover() or try group="all".`
+      : "Error: No other agents online. You're alone. Wait for others to join or check agent_discover().";
   }
 
-  await db.logMessage("BROADCAST", args.agent_id, null, null, args.message);
-  logToFile("BROADCAST", `${senderName}: ${args.message}`);
+  await db.logMessage("BROADCAST", sender.id, null, null, args.message);
+  logToFile("BROADCAST", `${args.name}: ${args.message}`);
 
-  const formattedMsg = `[${senderName}] ${args.message}`;
+  const formattedMsg = `[${args.name}] ${args.message}`;
   const results: string[] = [];
 
   for (const target of targets) {
@@ -290,28 +332,23 @@ async function agentBroadcast(args: z.infer<typeof AgentBroadcastSchema>): Promi
 }
 
 async function agentDM(args: z.infer<typeof AgentDMSchema>): Promise<string> {
-  // Try ID first, fallback to name (handles re-registration with new ID)
-  let sender = await db.getAgent(args.agent_id);
-  if (!sender) {
-    const name = args.agent_id.split("-").slice(0, -1).join("-");
-    sender = await db.getAgentByName(name);
-  }
-  if (!sender) return `Sender ${args.agent_id} not registered. Registration may have failed (pane collision?).`;
-  const senderName = sender.name;
-
-  // Try full ID first, then fallback to name lookup (short ID resolution)
-  let target = await db.getAgent(args.to);
-  if (!target) {
-    target = await db.getAgentByName(args.to);
+  const sender = await db.getAgentByName(args.name);
+  if (!sender || !sender.id) {
+    return `Error: You (${args.name}) not registered or registration incomplete. Call agent_register(name, description) first.`;
   }
 
-  if (!target) return `Agent ${args.to} not found`;
-  if (!target.pane_id) return `Agent ${args.to} has no tmux pane`;
+  const target = await db.getAgentByName(args.to);
+  if (!target || !target.id) {
+    const agents = await db.getAgents();
+    const names = agents.map(a => a.name).join(", ");
+    return `Error: Agent '${args.to}' not found. Active agents: ${names || "none"}. Use agent_discover() to refresh.`;
+  }
+  if (!target.pane_id) return `Error: Agent '${args.to}' has no tmux pane (may have disconnected). Use agent_discover() to see active agents.`;
 
-  await db.logMessage("DM", args.agent_id, args.to, null, args.message);
-  logToFile("DM", `${senderName} -> ${target.name}: ${args.message}`);
+  await db.logMessage("DM", sender.id, target.id, null, args.message);
+  logToFile("DM", `${args.name} -> ${target.name}: ${args.message}`);
 
-  const formattedMsg = `[DM from ${senderName}] ${args.message}`;
+  const formattedMsg = `[DM from ${args.name}] ${args.message}`;
 
   try {
     await runSnd(target.pane_id, formattedMsg);
@@ -346,21 +383,16 @@ async function agentGroups(): Promise<string> {
 }
 
 async function channelSend(args: z.infer<typeof ChannelSendSchema>): Promise<string> {
-  // Try ID first, fallback to name (handles re-registration with new ID)
-  let sender = await db.getAgent(args.agent_id);
-  if (!sender) {
-    const name = args.agent_id.split("-").slice(0, -1).join("-");
-    sender = await db.getAgentByName(name);
-  }
-  const senderName = sender?.name || args.agent_id.split("-").slice(0, -1).join("-");
+  const sender = await db.getAgentByName(args.name);
+  const senderId = sender?.id || args.name;
 
-  await db.logMessage("CHANNEL", args.agent_id, null, args.channel, args.message);
+  await db.logMessage("CHANNEL", senderId, null, args.channel, args.message);
 
   // Notify all agents in channel's group (channel name = group name convention)
   const agents = await db.getAgents(args.channel);
-  const targets = agents.filter(a => a.id !== args.agent_id && a.pane_id);
+  const targets = agents.filter(a => a.name !== args.name && a.pane_id);
 
-  const formattedMsg = `[#${args.channel}] ${senderName}: ${args.message}`;
+  const formattedMsg = `[#${args.channel}] ${args.name}: ${args.message}`;
 
   for (const target of targets) {
     if (target.pane_id) {
@@ -380,6 +412,21 @@ async function channelHistory(args: z.infer<typeof ChannelHistorySchema>): Promi
 
   if (messages.length === 0) return `No messages in #${args.channel}`;
 
+  if (args.detailed) {
+    // Full metadata: id, timestamp, from_agent, content
+    return JSON.stringify({
+      channel: args.channel,
+      count: messages.length,
+      messages: messages.reverse().map(m => ({
+        id: m.id,
+        timestamp: m.timestamp,
+        from: m.from_agent,
+        content: m.content,
+      })),
+    });
+  }
+
+  // Compact: just time, name, content
   const lines = messages.reverse().map(m => {
     const ts = new Date(m.timestamp).toLocaleTimeString();
     const from = m.from_agent?.split("-")[0] || "unknown";
@@ -390,18 +437,33 @@ async function channelHistory(args: z.infer<typeof ChannelHistorySchema>): Promi
 }
 
 async function dmHistory(args: z.infer<typeof DmHistorySchema>): Promise<string> {
-  // Resolve with_agent - try full ID first, then name
-  let otherAgent = await db.getAgent(args.with_agent);
-  if (!otherAgent) {
-    otherAgent = await db.getAgentByName(args.with_agent);
-  }
-  const otherId = otherAgent?.id || args.with_agent;
-  const otherName = otherAgent?.name || args.with_agent.split("-")[0];
+  const myAgent = await db.getAgentByName(args.name);
+  const otherAgent = await db.getAgentByName(args.with_agent);
 
-  const messages = await db.getDmHistory(args.agent_id, otherId, args.limit);
+  const myId = myAgent?.id || args.name;
+  const otherId = otherAgent?.id || args.with_agent;
+  const otherName = otherAgent?.name || args.with_agent;
+
+  const messages = await db.getDmHistory(myId, otherId, args.limit);
 
   if (messages.length === 0) return `No DM history with ${otherName}`;
 
+  if (args.detailed) {
+    // Full metadata
+    return JSON.stringify({
+      with_agent: otherName,
+      count: messages.length,
+      messages: messages.reverse().map(m => ({
+        id: m.id,
+        timestamp: m.timestamp,
+        from: m.from_agent,
+        to: m.to_agent,
+        content: m.content,
+      })),
+    });
+  }
+
+  // Compact
   const lines = messages.reverse().map(m => {
     const ts = new Date(m.timestamp).toLocaleTimeString();
     const from = m.from_agent?.split("-")[0] || "unknown";
@@ -429,6 +491,21 @@ async function messagesSince(args: z.infer<typeof MessagesSinceSchema>): Promise
   return JSON.stringify({ messages, last_id: lastId });
 }
 
+async function toolMetrics(args: z.infer<typeof ToolMetricsSchema>): Promise<string> {
+  const summary = await db.getToolMetricsSummary(args.days);
+
+  if (summary.length === 0) return `No tool metrics in last ${args.days} days.`;
+
+  const totalCalls = summary.reduce((sum, t) => sum + t.call_count, 0);
+  const totalChars = summary.reduce((sum, t) => sum + t.total_chars, 0);
+
+  const lines = summary.map(t =>
+    `- ${t.tool_name}: ${t.call_count} calls, avg ${t.avg_chars} chars, total ${t.total_chars} chars${t.error_count > 0 ? ` (${t.error_count} errors)` : ""}`
+  );
+
+  return `Tool metrics (last ${args.days} days):\n${lines.join("\n")}\n\nTotal: ${totalCalls} calls, ${totalChars} chars (~${Math.round(totalChars / 4)} tokens)`;
+}
+
 const server = new Server(
   { name: "agents-mcp-server", version: "2.0.0" },
   { capabilities: { tools: {} } }
@@ -438,6 +515,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
+  const startTime = Date.now();
 
   try {
     let result: string;
@@ -476,13 +554,30 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       case "messages_since":
         result = await messagesSince(MessagesSinceSchema.parse(args));
         break;
+      case "tool_metrics":
+        result = await toolMetrics(ToolMetricsSchema.parse(args));
+        break;
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
 
-    return { content: [{ type: "text" as const, text: result }] };
+    // Track metrics
+    const durationMs = Date.now() - startTime;
+    const responseChars = result.length;
+    const responseLines = result.split("\n").length;
+    await db.logToolMetric(name, responseChars, responseLines, durationMs, false);
+
+    // Append _meta for transparency (tokens ≈ chars/4)
+    const meta = { _meta: { chars: responseChars, lines: responseLines, ms: durationMs } };
+    const finalResult = result.startsWith("{") ?
+      JSON.stringify({ ...JSON.parse(result), ...meta }) :
+      `${result}\n---\n_meta: ${JSON.stringify(meta._meta)}`;
+
+    return { content: [{ type: "text" as const, text: finalResult }] };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
+    const durationMs = Date.now() - startTime;
+    await db.logToolMetric(name, msg.length, 1, durationMs, true);
     return { content: [{ type: "text" as const, text: `Error: ${msg}` }], isError: true };
   }
 });
