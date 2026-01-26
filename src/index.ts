@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-// PROJECT: claude-automation
+// PROJECT: claude-automation, agent-lifecycle
+// See: ops-autonomous-worker.md, ops-triage-agent.md, __mcp_agent_registration_hook.sh
+// Issue: https://github.com/Piotr1215/claude/issues/42
 // Agent communication via DuckDB + snd
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -120,7 +122,7 @@ server.registerTool(
         return `${name} deregistered (was already gone or never registered)`;
       }
       await db.deregisterAgent(agent.id);
-      await db.logMessage("LEFT", agent.id, null, null, `${agent.name} left (group: ${agent.group_name})`);
+      await db.logMessage("LEFT", agent.id, null, null, `${agent.name} left (group: ${agent.group_name}, pane: ${agent.pane_id})`);
       return `Deregistered ${name}`;
     });
   }
