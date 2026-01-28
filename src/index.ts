@@ -161,7 +161,7 @@ server.registerTool(
 
       if (targets.length === 0) {
         const allAgents = await db.getAgents();
-        const groups = [...new Set(allAgents.map(a => a.group_name))];
+        const groups = [...new Set(allAgents.filter(a => a && a.group_name).map(a => a.group_name))];
         return targetGroup
           ? `Error: No agents in group '${targetGroup}'. Available groups: ${groups.join(", ")}. Use agent_discover() or try group="all".`
           : "Error: No other agents online. You're alone. Wait for others to join or check agent_discover().";
@@ -213,7 +213,7 @@ server.registerTool(
       const target = await db.getAgentByName(to);
       if (!target || !target.id) {
         const agents = await db.getAgents();
-        const names = agents.map(a => a.name).join(", ");
+        const names = agents.filter(a => a && a.name).map(a => a.name).join(", ");
         return `Error: Agent '${to}' not found. Active agents: ${names || "none"}. Use agent_discover() to refresh.`;
       }
       if (!target.pane_id) return `Error: Agent '${to}' has no tmux pane (may have disconnected). Use agent_discover() to see active agents.`;
