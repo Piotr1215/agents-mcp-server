@@ -87,16 +87,17 @@ server.registerTool(
   },
   async ({ name, description, group }) => {
     return withMetrics("agent_register", async () => {
+      const groupName = group || "default";
       const existing = await db.getAgentByName(name);
-      const agentId = existing ? existing.id : generateAgentId(name);
-      const allAgents = await db.getAgents(group);
+      const agentId = existing?.id || generateAgentId(name);
+      const allAgents = await db.getAgents(groupName);
       const peers = allAgents
-        .filter(a => a.name !== name)
+        .filter(a => a && a.name && a.name !== name)
         .map(a => ({ name: a.name, group: a.group_name }));
 
       return JSON.stringify({
         agent_id: agentId,
-        group,
+        group: groupName,
         peers,
         message: "Registered. Use your name for subsequent calls."
       });
@@ -151,7 +152,7 @@ server.registerTool(
       const senderGroup = sender.group_name || "default";
 
       let agents = await db.getAgents();
-      let targets = agents.filter(a => a.name !== name && a.pane_id);
+      let targets = agents.filter(a => a && a.name && a.name !== name && a.pane_id);
 
       const targetGroup = group === "all" ? null : (group || senderGroup);
       if (targetGroup) {
@@ -247,17 +248,18 @@ server.registerTool(
   async ({ include_stale, group }) => {
     return withMetrics("agent_discover", async () => {
       const agents = await db.getAgents(group || undefined);
+      const validAgents = agents.filter(a => a && a.id && a.name);
 
-      if (agents.length === 0) {
+      if (validAgents.length === 0) {
         return group ? `No agents in group '${group}'` : "No agents currently registered.";
       }
 
-      const lines = agents.map(a =>
-        `- ${a.name} (${a.id}): active | group: ${a.group_name} | pane: ${a.pane_id || "unknown"}`
+      const lines = validAgents.map(a =>
+        `- ${a.name} (${a.id}): active | group: ${a.group_name || "default"} | pane: ${a.pane_id || "unknown"}`
       );
 
       const groupInfo = group ? ` in group '${group}'` : "";
-      return `Active agents (${agents.length})${groupInfo}:\n${lines.join("\n")}`;
+      return `Active agents (${validAgents.length})${groupInfo}:\n${lines.join("\n")}`;
     });
   }
 );
@@ -304,7 +306,7 @@ server.registerTool(
       await db.logMessage("CHANNEL", senderId, null, channel, message);
 
       const agents = await db.getAgents(channel);
-      const targets = agents.filter(a => a.name !== name && a.pane_id);
+      const targets = agents.filter(a => a && a.name && a.name !== name && a.pane_id);
 
       const formattedMsg = `[#${channel}] ${name}: ${message}`;
 
@@ -342,11 +344,13 @@ server.registerTool(
 
       if (messages.length === 0) return `No messages in #${channel}`;
 
+      const validMessages = messages.filter(m => m && m.id);
+
       if (detailed) {
         return JSON.stringify({
           channel,
-          count: messages.length,
-          messages: messages.reverse().map(m => ({
+          count: validMessages.length,
+          messages: validMessages.reverse().map(m => ({
             id: m.id,
             timestamp: m.timestamp,
             from: m.from_agent,
@@ -355,7 +359,7 @@ server.registerTool(
         });
       }
 
-      const lines = messages.reverse().map(m => {
+      const lines = validMessages.reverse().map(m => {
         const ts = new Date(m.timestamp).toLocaleTimeString();
         const from = m.from_agent?.split("-")[0] || "unknown";
         return `[${ts}] ${from}: ${m.content}`;
@@ -390,14 +394,15 @@ server.registerTool(
       const otherName = otherAgent?.name || with_agent;
 
       const messages = await db.getDmHistory(myId, otherId, limit);
+      const validMessages = messages.filter(m => m && m.id);
 
-      if (messages.length === 0) return `No DM history with ${otherName}`;
+      if (validMessages.length === 0) return `No DM history with ${otherName}`;
 
       if (detailed) {
         return JSON.stringify({
           with_agent: otherName,
-          count: messages.length,
-          messages: messages.reverse().map(m => ({
+          count: validMessages.length,
+          messages: validMessages.reverse().map(m => ({
             id: m.id,
             timestamp: m.timestamp,
             from: m.from_agent,
@@ -407,13 +412,13 @@ server.registerTool(
         });
       }
 
-      const lines = messages.reverse().map(m => {
+      const lines = validMessages.reverse().map(m => {
         const ts = new Date(m.timestamp).toLocaleTimeString();
         const from = m.from_agent?.split("-")[0] || "unknown";
         return `[${ts}] ${from}: ${m.content}`;
       });
 
-      return `DM history with ${otherName} (${messages.length}):\n${lines.join("\n")}`;
+      return `DM history with ${otherName} (${validMessages.length}):\n${lines.join("\n")}`;
     });
   }
 );
@@ -454,11 +459,12 @@ server.registerTool(
   async ({ since_id, limit }) => {
     return withMetrics("messages_since", async () => {
       const messages = await db.getMessagesSince(since_id, limit);
+      const validMessages = messages.filter(m => m && m.id);
 
-      if (messages.length === 0) return JSON.stringify({ messages: [], last_id: since_id });
+      if (validMessages.length === 0) return JSON.stringify({ messages: [], last_id: since_id });
 
-      const lastId = messages[messages.length - 1].id;
-      return JSON.stringify({ messages, last_id: lastId });
+      const lastId = validMessages[validMessages.length - 1].id;
+      return JSON.stringify({ messages: validMessages, last_id: lastId });
     });
   }
 );
