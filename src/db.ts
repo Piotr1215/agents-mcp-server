@@ -42,6 +42,7 @@ function initSchema(): void {
       name VARCHAR NOT NULL,
       group_name VARCHAR DEFAULT 'default',
       pane_id VARCHAR,
+      stable_pane VARCHAR,
       registered_at TIMESTAMP DEFAULT now()
     );
     CREATE TABLE IF NOT EXISTS messages (
@@ -78,6 +79,7 @@ export interface Agent {
   name: string;
   group_name: string;
   pane_id: string | null;
+  stable_pane: string | null;
   registered_at: Date;
 }
 

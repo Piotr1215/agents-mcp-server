@@ -19,9 +19,12 @@ function logToFile(type: string, content: string): void {
   appendFileSync(LOG_FILE, `[${ts}] [${type}] ${content}\n`);
 }
 
-async function runSnd(pane: string, message: string): Promise<void> {
+async function runSnd(pane: string, message: string, stablePane?: string | null): Promise<void> {
+  // Prefer stable_pane (session:window.pane format) over ephemeral pane_id (%123)
+  // Stable format survives tmux session restarts
+  const target = stablePane || pane;
   return new Promise((resolve, reject) => {
-    const proc = spawn(SND_PATH, ["--pane", pane, message], {
+    const proc = spawn(SND_PATH, ["--pane", target, message], {
       stdio: ["pipe", "pipe", "pipe"],
     });
     proc.on("close", (code) => {
@@ -175,8 +178,8 @@ server.registerTool(
 
       for (const target of targets) {
         try {
-          if (target.pane_id) {
-            await runSnd(target.pane_id, formattedMsg);
+          if (target.pane_id || target.stable_pane) {
+            await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
             results.push(`✓ ${target.name}`);
           }
         } catch (err) {
@@ -216,7 +219,7 @@ server.registerTool(
         const names = agents.filter(a => a && a.name).map(a => a.name).join(", ");
         return `Error: Agent '${to}' not found. Active agents: ${names || "none"}. Use agent_discover() to refresh.`;
       }
-      if (!target.pane_id) return `Error: Agent '${to}' has no tmux pane (may have disconnected). Use agent_discover() to see active agents.`;
+      if (!target.pane_id && !target.stable_pane) return `Error: Agent '${to}' has no tmux pane (may have disconnected). Use agent_discover() to see active agents.`;
 
       await db.logMessage("DM", sender.id, target.id, null, message);
       logToFile("DM", `${name} -> ${target.name}: ${message}`);
@@ -224,7 +227,7 @@ server.registerTool(
       const formattedMsg = `[DM from ${name}] ${message}`;
 
       try {
-        await runSnd(target.pane_id, formattedMsg);
+        await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
         return `DM sent to ${target.name}`;
       } catch (err) {
         return `Failed to send DM: ${err}`;
@@ -306,14 +309,14 @@ server.registerTool(
       await db.logMessage("CHANNEL", senderId, null, channel, message);
 
       const agents = await db.getAgents(channel);
-      const targets = agents.filter(a => a && a.name && a.name !== name && a.pane_id);
+      const targets = agents.filter(a => a && a.name && a.name !== name && (a.pane_id || a.stable_pane));
 
       const formattedMsg = `[#${channel}] ${name}: ${message}`;
 
       for (const target of targets) {
-        if (target.pane_id) {
+        if (target.pane_id || target.stable_pane) {
           try {
-            await runSnd(target.pane_id, formattedMsg);
+            await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
           } catch {
             // Continue on failure
           }
