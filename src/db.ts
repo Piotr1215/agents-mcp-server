@@ -11,26 +11,41 @@ function esc(value: string): string {
   return value.replace(/'/g, "''").replace(/\\/g, "\\\\");
 }
 
-function dbQuery(sql: string): string {
-  try {
-    return execSync(`duckdb "${DB_PATH}" -json -c "${sql.replace(/"/g, '\\"')}"`, {
-      encoding: "utf-8",
-      timeout: 5000,
-    }).trim();
-  } catch (e) {
-    console.error("[db] Query failed:", e);
-    return "[]";
+function dbQuery(sql: string, retries = 3): string {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      return execSync(`duckdb "${DB_PATH}" -json -c "${sql.replace(/"/g, '\\"')}"`, {
+        encoding: "utf-8",
+        timeout: 5000,
+      }).trim();
+    } catch (e) {
+      if (attempt === retries - 1) {
+        console.error("[db] Query failed after retries:", e);
+        return "[]";
+      }
+      const delay = Math.pow(2, attempt) * 50;
+      execSync(`sleep ${delay / 1000}`);
+    }
   }
+  return "[]";
 }
 
-function dbExec(sql: string): void {
-  try {
-    execSync(`duckdb "${DB_PATH}" -c "${sql.replace(/"/g, '\\"')}"`, {
-      encoding: "utf-8",
-      timeout: 5000,
-    });
-  } catch (e) {
-    console.error("[db] Exec failed:", e);
+function dbExec(sql: string, retries = 3): void {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      execSync(`duckdb "${DB_PATH}" -c "${sql.replace(/"/g, '\\"')}"`, {
+        encoding: "utf-8",
+        timeout: 5000,
+      });
+      return;
+    } catch (e) {
+      if (attempt === retries - 1) {
+        console.error("[db] Exec failed after retries:", e);
+        return;
+      }
+      const delay = Math.pow(2, attempt) * 50;
+      execSync(`sleep ${delay / 1000}`);
+    }
   }
 }
 
