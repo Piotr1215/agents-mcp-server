@@ -123,11 +123,27 @@ server.registerTool(
     return withMetrics("agent_deregister", async () => {
       const agent = await db.getAgentByName(name);
       if (!agent || !agent.id) {
-        return `${name} deregistered (was already gone or never registered)`;
+        return JSON.stringify({
+          success: true,
+          name,
+          message: "was already gone or never registered"
+        });
       }
+      // Capture info BEFORE deletion for hook to use
+      const agentInfo = {
+        id: agent.id,
+        name: agent.name,
+        group_name: agent.group_name || "default",
+        pane_id: agent.pane_id,
+        stable_pane: agent.stable_pane
+      };
       await db.deregisterAgent(agent.id);
       await db.logMessage("LEFT", agent.id, null, null, `${agent.name} left (group: ${agent.group_name}, pane: ${agent.pane_id})`);
-      return `Deregistered ${name}`;
+      return JSON.stringify({
+        success: true,
+        ...agentInfo,
+        message: `Deregistered ${name}`
+      });
     });
   }
 );
