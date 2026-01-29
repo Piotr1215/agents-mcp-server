@@ -135,7 +135,8 @@ export async function getAgentByName(name: string): Promise<Agent | null> {
 export async function logMessage(type: string, from: string | null, to: string | null, channel: string | null, content: string): Promise<number> {
   initSchema();
   const idResult = dbQuery(`SELECT nextval('msg_seq') as id`);
-  const id = JSON.parse(idResult || "[{\"id\":1}]")[0].id;
+  const rows = JSON.parse(idResult || "[]");
+  const id = rows[0]?.id ?? Date.now();
   dbExec(`INSERT INTO messages (id, type, from_agent, to_agent, channel, content) VALUES (${id}, '${esc(type)}', ${from ? `'${esc(from)}'` : 'NULL'}, ${to ? `'${esc(to)}'` : 'NULL'}, ${channel ? `'${esc(channel)}'` : 'NULL'}, '${esc(content)}')`);
   return id;
 }
@@ -183,7 +184,8 @@ export interface ToolMetric {
 export async function logToolMetric(toolName: string, responseChars: number, responseLines: number, durationMs: number | null, isError: boolean): Promise<void> {
   initSchema();
   const idResult = dbQuery(`SELECT nextval('metric_seq') as id`);
-  const id = JSON.parse(idResult || "[{\"id\":1}]")[0].id;
+  const rows = JSON.parse(idResult || "[]");
+  const id = rows[0]?.id ?? Date.now();
   dbExec(`INSERT INTO tool_metrics (id, tool_name, response_chars, response_lines, duration_ms, is_error) VALUES (${id}, '${esc(toolName)}', ${responseChars}, ${responseLines}, ${durationMs ?? 'NULL'}, ${isError})`);
 }
 
