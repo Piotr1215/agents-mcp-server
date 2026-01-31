@@ -20,9 +20,10 @@ function logToFile(type: string, content: string): void {
 }
 
 async function runSnd(pane: string, message: string, stablePane?: string | null): Promise<void> {
-  // Prefer stable_pane (session:window.pane format) over ephemeral pane_id (%123)
-  // Stable format survives tmux session restarts
-  const target = stablePane || pane;
+  // Prefer pane_id (%123) - stable within session, survives pane reordering
+  // Fall back to stable_pane only if pane_id missing
+  const target = pane || stablePane || "";
+  if (!target) return;
   return new Promise((resolve, reject) => {
     const proc = spawn(SND_PATH, ["--pane", target, message], {
       stdio: ["pipe", "pipe", "pipe"],
