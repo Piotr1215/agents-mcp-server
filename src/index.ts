@@ -94,6 +94,11 @@ server.registerTool(
       const groupName = group || "default";
       const existing = await db.getAgentByName(name);
       const agentId = existing?.id || generateAgentId(name);
+
+      // Write to DB immediately so agent is findable even if hook fails
+      // Hook will update with pane info later
+      await db.registerAgent(agentId, name, groupName, existing?.pane_id || "");
+
       const allAgents = await db.getAgents(groupName);
       const peers = allAgents
         .filter(a => a && a.name && a.name !== name)
