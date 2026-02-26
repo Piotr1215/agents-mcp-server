@@ -168,6 +168,12 @@ export async function getDmHistory(agent1: string, agent2: string, limit = 50): 
   return JSON.parse(result || "[]") as Message[];
 }
 
+export async function getGroupHistory(group: string, limit = 50): Promise<Message[]> {
+  initSchema();
+  const result = dbQuery(`SELECT * FROM messages WHERE channel = '${esc(group)}' AND type IN ('BROADCAST', 'LEFT', 'JOINED') ORDER BY timestamp DESC LIMIT ${limit}`);
+  return JSON.parse(result || "[]") as Message[];
+}
+
 export async function getMessagesSince(sinceId: number, limit = 100): Promise<Message[]> {
   initSchema();
   const result = dbQuery(`SELECT * FROM messages WHERE id > ${sinceId} ORDER BY id ASC LIMIT ${limit}`);

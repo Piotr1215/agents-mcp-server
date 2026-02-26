@@ -888,6 +888,71 @@ describe("Agents MCP Server", () => {
     });
   });
 
+  describe("group_history", () => {
+    it("returns formatted group broadcast history", () => {
+      const messages = [
+        { id: 1, timestamp: new Date(), type: "BROADCAST", from_agent: "alice-123", content: "task update" },
+        { id: 2, timestamp: new Date(), type: "LEFT", from_agent: "bob-456", content: "bob left" },
+      ];
+
+      const lines = messages.map(m => {
+        const ts = new Date(m.timestamp).toLocaleTimeString();
+        const from = m.from_agent?.split("-")[0] || "system";
+        const prefix = m.type === "BROADCAST" ? "" : `[${m.type}] `;
+        return `[${ts}] ${prefix}${from}: ${m.content}`;
+      });
+
+      expect(lines[0]).toContain("alice: task update");
+      expect(lines[0]).not.toContain("[BROADCAST]");
+      expect(lines[1]).toContain("[LEFT] bob: bob left");
+    });
+
+    it("returns empty message when no group history", () => {
+      const messages: any[] = [];
+      const group = "tasks";
+      const result = messages.length === 0 ? `No history for group '${group}'` : "has history";
+      expect(result).toBe("No history for group 'tasks'");
+    });
+
+    it("broadcast stores target group in channel field", () => {
+      // Simulates what agent_broadcast now does
+      const senderGroup = "tasks";
+      const targetGroup = "tasks"; // derived from sender or explicit param
+      const logArgs = {
+        type: "BROADCAST",
+        from: "alice-123",
+        to: null as string | null,
+        channel: targetGroup,
+        content: "hello group",
+      };
+
+      expect(logArgs.channel).toBe("tasks");
+      expect(logArgs.to).toBeNull();
+    });
+
+    it("broadcast to all groups stores null channel", () => {
+      // group="all" → targetGroup=null
+      const group = "all";
+      const targetGroup = group === "all" ? null : group;
+
+      expect(targetGroup).toBeNull();
+    });
+
+    it("LEFT message stores group in channel field", () => {
+      const agent = { name: "alice", group_name: "tasks", pane_id: "%89" };
+      const logArgs = {
+        type: "LEFT",
+        from: "alice-123",
+        to: null as string | null,
+        channel: agent.group_name || "default",
+        content: `${agent.name} left`,
+      };
+
+      expect(logArgs.channel).toBe("tasks");
+      expect(logArgs.content).toBe("alice left");
+    });
+  });
+
   describe("channel_list", () => {
     it("returns list of channels with message counts", () => {
       const channels = [

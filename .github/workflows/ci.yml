@@ -16,6 +16,11 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Install DuckDB CLI
+        run: |
+          curl -fsSL https://install.duckdb.org | sh
+          echo "$HOME/.duckdb/cli/latest" >> $GITHUB_PATH
+
       - name: Install dependencies
         run: npm ci
 

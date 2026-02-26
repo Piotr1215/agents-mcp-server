@@ -144,7 +144,7 @@ server.registerTool(
         stable_pane: agent.stable_pane
       };
       await db.deregisterAgent(agent.id);
-      await db.logMessage("LEFT", agent.id, null, null, `${agent.name} left (group: ${agent.group_name}, pane: ${agent.pane_id})`);
+      await db.logMessage("LEFT", agent.id, null, agent.group_name || "default", `${agent.name} left`);
       return JSON.stringify({
         success: true,
         ...agentInfo,
@@ -192,7 +192,7 @@ server.registerTool(
           : "Error: No other agents online. You're alone. Wait for others to join or check agent_discover().";
       }
 
-      await db.logMessage("BROADCAST", sender.id, null, null, message);
+      await db.logMessage("BROADCAST", sender.id, null, targetGroup, message);
       logToFile("BROADCAST", `${name}: ${message}`);
 
       const formattedMsg = `[${name}] ${message}`;
@@ -465,6 +465,38 @@ server.registerTool(
 
       const lines = channels.map(c => `- #${c.channel} (${c.message_count} messages)`);
       return `Active channels (${channels.length}):\n${lines.join("\n")}`;
+    });
+  }
+);
+
+// Tool: group_history
+server.registerTool(
+  "group_history",
+  {
+    title: "Read Group History",
+    description: "Get recent broadcast and system messages for a group.",
+    inputSchema: {
+      group: z.string().describe("Group name"),
+      limit: z.number().optional().default(50).describe("Max messages to return (default: 50)"),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ group, limit }) => {
+    return withMetrics("group_history", async () => {
+      const messages = await db.getGroupHistory(group, limit);
+
+      if (messages.length === 0) return `No history for group '${group}'`;
+
+      const validMessages = messages.filter(m => m && m.id);
+
+      const lines = validMessages.reverse().map(m => {
+        const ts = new Date(m.timestamp).toLocaleTimeString();
+        const from = m.from_agent?.split("-")[0] || "system";
+        const prefix = m.type === "BROADCAST" ? "" : `[${m.type}] `;
+        return `[${ts}] ${prefix}${from}: ${m.content}`;
+      });
+
+      return `Group '${group}' history (${validMessages.length}):\n${lines.join("\n")}`;
     });
   }
 );
