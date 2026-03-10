@@ -311,11 +311,13 @@ server.registerTool(
 );
 
 // Tool: channel_send
+// Channels are async bulletin boards — log to DB only, no tmux nudge.
+// Use agent_dm or agent_broadcast when you need real-time delivery.
 server.registerTool(
   "channel_send",
   {
     title: "Post to Channel",
-    description: "Send a message to a channel.",
+    description: "Log a message to a channel (async bulletin board). Does NOT nudge agents — use agent_dm or agent_broadcast for real-time delivery. Agents read channels via channel_history.",
     inputSchema: {
       name: z.string().describe("Your agent name"),
       channel: z.string().describe("Channel name"),
@@ -329,23 +331,9 @@ server.registerTool(
       const senderId = sender?.id || name;
 
       await db.logMessage("CHANNEL", senderId, null, channel, message);
+      logToFile("CHANNEL", `#${channel} ${name}: ${message}`);
 
-      const agents = await db.getAgents(channel);
-      const targets = agents.filter(a => a && a.name && a.name !== name && (a.pane_id || a.stable_pane));
-
-      const formattedMsg = `[#${channel}] ${name}: ${message}`;
-
-      for (const target of targets) {
-        if (target.pane_id || target.stable_pane) {
-          try {
-            await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
-          } catch {
-            // Continue on failure
-          }
-        }
-      }
-
-      return `Message sent to #${channel} (${targets.length} recipients)`;
+      return `Message logged to #${channel}`;
     });
   }
 );
