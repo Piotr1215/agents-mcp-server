@@ -5,35 +5,16 @@
 // Agent communication via DuckDB + snd
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { spawn } from "child_process";
 import { randomBytes } from "crypto";
 import { z } from "zod";
 import { appendFileSync } from "fs";
 import * as db from "./db.js";
 
-const SND_PATH = process.env.SND_PATH || "/home/decoder/.claude/scripts/snd";
 const LOG_FILE = "/tmp/agent_messages.log";
 
 function logToFile(type: string, content: string): void {
   const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
   appendFileSync(LOG_FILE, `[${ts}] [${type}] ${content}\n`);
-}
-
-async function runSnd(pane: string, message: string, stablePane?: string | null): Promise<void> {
-  // Prefer pane_id (%123) - stable within session, survives pane reordering
-  // Fall back to stable_pane only if pane_id missing
-  const target = pane || stablePane || "";
-  if (!target) return;
-  return new Promise((resolve, reject) => {
-    const proc = spawn(SND_PATH, ["--pane", target, message], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    proc.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`snd failed with code ${code}`));
-    });
-    proc.on("error", reject);
-  });
 }
 
 function generateAgentId(name: string): string {
@@ -177,7 +158,7 @@ server.registerTool(
       const senderGroup = sender.group_name || "default";
 
       let agents = await db.getAgents();
-      let targets = agents.filter(a => a && a.name && a.name !== name && a.pane_id);
+      let targets = agents.filter(a => a && a.name && a.name !== name);
 
       const targetGroup = group === "all" ? null : (group || senderGroup);
       if (targetGroup) {
@@ -195,22 +176,8 @@ server.registerTool(
       await db.logMessage("BROADCAST", sender.id, null, targetGroup, message);
       logToFile("BROADCAST", `${name}: ${message}`);
 
-      const formattedMsg = `[${name}] ${message}`;
-      const results: string[] = [];
-
-      for (const target of targets) {
-        try {
-          if (target.pane_id || target.stable_pane) {
-            await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
-            results.push(`✓ ${target.name}`);
-          }
-        } catch (err) {
-          results.push(`✗ ${target.name}: ${err}`);
-        }
-      }
-
       const groupInfo = targetGroup ? ` in group '${targetGroup}'` : " (all groups)";
-      return `Broadcast sent to ${targets.length} agent(s)${groupInfo}:\n${results.join("\n")}`;
+      return `Broadcast logged for ${targets.length} agent(s)${groupInfo}. Agents will see it on next poll.`;
     });
   }
 );
@@ -241,19 +208,11 @@ server.registerTool(
         const names = agents.filter(a => a && a.name).map(a => a.name).join(", ");
         return `Error: Agent '${to}' not found. Active agents: ${names || "none"}. Use agent_discover() to refresh.`;
       }
-      if (!target.pane_id && !target.stable_pane) return `Error: Agent '${to}' has no tmux pane (may have disconnected). Use agent_discover() to see active agents.`;
 
       await db.logMessage("DM", sender.id, target.id, null, message);
       logToFile("DM", `${name} -> ${target.name}: ${message}`);
 
-      const formattedMsg = `[DM from ${name}] ${message}`;
-
-      try {
-        await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
-        return `DM sent to ${target.name}`;
-      } catch (err) {
-        return `Failed to send DM: ${err}`;
-      }
+      return `DM logged for ${target.name}. They will see it on next poll.`;
     });
   }
 );
@@ -539,6 +498,43 @@ server.registerTool(
       );
 
       return `Tool metrics (last ${days} days):\n${lines.join("\n")}\n\nTotal: ${totalCalls} calls, ${totalChars} chars (~${Math.round(totalChars / 4)} tokens)`;
+    });
+  }
+);
+
+// Tool: poll_messages
+server.registerTool(
+  "poll_messages",
+  {
+    title: "Poll My Messages",
+    description: "Poll for new DMs and broadcasts since last check. Returns messages addressed to you. Use from a CronCreate loop.",
+    inputSchema: {
+      name: z.string().describe("Your agent name"),
+      since_id: z.number().optional().default(0).describe("Last seen message ID (0 for first poll)"),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ name, since_id }) => {
+    return withMetrics("poll_messages", async () => {
+      const agent = await db.getAgentByName(name);
+      if (!agent || !agent.id) {
+        return `Error: Agent '${name}' not registered. Call agent_register first.`;
+      }
+
+      const messages = await db.getMessagesForAgent(agent.id, agent.group_name || "default", since_id || 0);
+      const validMessages = messages.filter(m => m && m.id);
+
+      if (validMessages.length === 0) return JSON.stringify({ messages: [], last_id: since_id });
+
+      const lastId = validMessages[validMessages.length - 1].id;
+      const formatted = validMessages.map(m => ({
+        id: m.id,
+        type: m.type,
+        from: m.from_agent?.split("-")[0] || "unknown",
+        content: m.content,
+      }));
+
+      return JSON.stringify({ messages: formatted, last_id: lastId });
     });
   }
 );

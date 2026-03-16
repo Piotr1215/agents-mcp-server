@@ -180,6 +180,22 @@ export async function getMessagesSince(sinceId: number, limit = 100): Promise<Me
   return JSON.parse(result || "[]") as Message[];
 }
 
+export async function getMessagesForAgent(agentId: string, groupName: string, sinceId: number, limit = 50): Promise<Message[]> {
+  initSchema();
+  const result = dbQuery(`
+    SELECT * FROM messages
+    WHERE id > ${sinceId}
+      AND (from_agent IS NULL OR from_agent != '${esc(agentId)}')
+      AND (
+        (type = 'DM' AND to_agent = '${esc(agentId)}')
+        OR (type = 'BROADCAST' AND channel = '${esc(groupName)}')
+      )
+    ORDER BY id ASC
+    LIMIT ${limit}
+  `);
+  return JSON.parse(result || "[]") as Message[];
+}
+
 export async function getGroups(): Promise<{group_name: string, count: number}[]> {
   initSchema();
   const result = dbQuery(`SELECT group_name, COUNT(*) as count FROM agents GROUP BY group_name ORDER BY group_name`);
