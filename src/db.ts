@@ -11,7 +11,7 @@ function esc(value: string): string {
   return value.replace(/'/g, "''").replace(/\\/g, "\\\\");
 }
 
-function dbQuery(sql: string, retries = 3): string {
+function dbQuery(sql: string, retries = 5): string {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       return execSync(`duckdb "${DB_PATH}" -json -c "${sql.replace(/"/g, '\\"')}"`, {
@@ -23,14 +23,14 @@ function dbQuery(sql: string, retries = 3): string {
         console.error("[db] Query failed after retries:", e);
         return "[]";
       }
-      const delay = Math.pow(2, attempt) * 50;
+      const delay = Math.pow(2, attempt) * 100;
       execSync(`sleep ${delay / 1000}`);
     }
   }
   return "[]";
 }
 
-function dbExec(sql: string, retries = 3): void {
+function dbExec(sql: string, retries = 5): void {
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       execSync(`duckdb "${DB_PATH}" -c "${sql.replace(/"/g, '\\"')}"`, {
@@ -43,7 +43,7 @@ function dbExec(sql: string, retries = 3): void {
         console.error("[db] Exec failed after retries:", e);
         return;
       }
-      const delay = Math.pow(2, attempt) * 50;
+      const delay = Math.pow(2, attempt) * 100;
       execSync(`sleep ${delay / 1000}`);
     }
   }
@@ -60,6 +60,7 @@ function initSchema(): void {
       stable_pane VARCHAR,
       registered_at TIMESTAMP DEFAULT now()
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_name ON agents(name);
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY,
       timestamp TIMESTAMP DEFAULT now(),
@@ -110,7 +111,7 @@ export interface Message {
 
 export async function registerAgent(id: string, name: string, group: string, paneId: string): Promise<void> {
   initSchema();
-  dbExec(`INSERT OR REPLACE INTO agents (id, name, group_name, pane_id, registered_at) VALUES ('${esc(id)}', '${esc(name)}', '${esc(group)}', '${esc(paneId)}', now())`);
+  dbExec(`INSERT INTO agents (id, name, group_name, pane_id, registered_at) VALUES ('${esc(id)}', '${esc(name)}', '${esc(group)}', '${esc(paneId)}', now()) ON CONFLICT(name) DO UPDATE SET id = EXCLUDED.id, group_name = EXCLUDED.group_name, pane_id = EXCLUDED.pane_id, registered_at = EXCLUDED.registered_at`);
 }
 
 export async function deregisterAgent(id: string): Promise<Agent | null> {
