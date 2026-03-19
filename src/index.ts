@@ -5,16 +5,33 @@
 // Agent communication via DuckDB + snd
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { spawn } from "child_process";
 import { randomBytes } from "crypto";
 import { z } from "zod";
 import { appendFileSync } from "fs";
 import * as db from "./db.js";
 
+const SND_PATH = process.env.SND_PATH || "/home/decoder/.claude/scripts/snd";
 const LOG_FILE = "/tmp/agent_messages.log";
 
 function logToFile(type: string, content: string): void {
   const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
   appendFileSync(LOG_FILE, `[${ts}] [${type}] ${content}\n`);
+}
+
+async function runSnd(pane: string, message: string, stablePane?: string | null): Promise<void> {
+  const target = pane || stablePane || "";
+  if (!target) return;
+  return new Promise((resolve, reject) => {
+    const proc = spawn(SND_PATH, ["--pane", target, message], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`snd failed with code ${code}`));
+    });
+    proc.on("error", reject);
+  });
 }
 
 function generateAgentId(name: string): string {
@@ -158,7 +175,7 @@ server.registerTool(
       const senderGroup = sender.group_name || "default";
 
       let agents = await db.getAgents();
-      let targets = agents.filter(a => a && a.name && a.name !== name);
+      let targets = agents.filter(a => a && a.name && a.name !== name && a.pane_id);
 
       const targetGroup = group === "all" ? null : (group || senderGroup);
       if (targetGroup) {
@@ -176,8 +193,22 @@ server.registerTool(
       await db.logMessage("BROADCAST", sender.id, null, targetGroup, message);
       logToFile("BROADCAST", `${name}: ${message}`);
 
+      const formattedMsg = `[${name}] ${message}`;
+      const results: string[] = [];
+
+      for (const target of targets) {
+        try {
+          if (target.pane_id || target.stable_pane) {
+            await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
+            results.push(`✓ ${target.name}`);
+          }
+        } catch (err) {
+          results.push(`✗ ${target.name}: ${err}`);
+        }
+      }
+
       const groupInfo = targetGroup ? ` in group '${targetGroup}'` : " (all groups)";
-      return `Broadcast logged for ${targets.length} agent(s)${groupInfo}. Agents will see it on next poll.`;
+      return `Broadcast sent to ${targets.length} agent(s)${groupInfo}:\n${results.join("\n")}`;
     });
   }
 );
@@ -208,11 +239,19 @@ server.registerTool(
         const names = agents.filter(a => a && a.name).map(a => a.name).join(", ");
         return `Error: Agent '${to}' not found. Active agents: ${names || "none"}. Use agent_discover() to refresh.`;
       }
+      if (!target.pane_id && !target.stable_pane) return `Error: Agent '${to}' has no tmux pane (may have disconnected). Use agent_discover() to see active agents.`;
 
       await db.logMessage("DM", sender.id, target.id, null, message);
       logToFile("DM", `${name} -> ${target.name}: ${message}`);
 
-      return `DM logged for ${target.name}. They will see it on next poll.`;
+      const formattedMsg = `[DM from ${name}] ${message}`;
+
+      try {
+        await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
+        return `DM sent to ${target.name}`;
+      } catch (err) {
+        return `Failed to send DM: ${err}`;
+      }
     });
   }
 );
