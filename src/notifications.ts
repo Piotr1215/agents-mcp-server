@@ -38,12 +38,25 @@ function metaBuilder(kind: string): {
   return { meta, add };
 }
 
-// Compose "[<from>@<host>] <content>" so the renderer's body preview shows
-// the sender even when meta attributes are hidden. Skip host when the event
-// originated locally.
-function withSenderPrefix(fromAgent: string, originHost: string, content: string, localHost: string): string {
-  const prefix = originHost === localHost ? `[${fromAgent}]` : `[${fromAgent}@${originHost}]`;
-  return `${prefix} ${content}`;
+// Compose body prefix so the renderer's one-line preview carries
+// kind + sender + compact timestamp — the three things meta attributes hide.
+// Shape: "<kind> HH:MM:SS [from@host] content"
+// Collapses an already-present "[HUMAN]" prefix from the wrapper so it is not
+// duplicated with the server-added "[from@host]".
+function withSenderPrefix(
+  kind: "dm" | "bcast" | "ch",
+  fromAgent: string,
+  originHost: string,
+  originTs: number,
+  content: string,
+  localHost: string,
+): string {
+  const sender = originHost === localHost ? `[${fromAgent}]` : `[${fromAgent}@${originHost}]`;
+  const hhmmss = new Date(originTs).toISOString().slice(11, 19);
+  // If the wrapper already prepended "[HUMAN] ", strip it — `from_agent` and
+  // `host` already carry that signal.
+  const stripped = content.replace(/^\[HUMAN\]\s*/, "");
+  return `<${kind}> ${hhmmss} ${sender} ${stripped}`;
 }
 
 export function buildChannelNotification(msg: RemoteChannelMessage, localHost: string): ChannelNotificationParams {
@@ -53,7 +66,7 @@ export function buildChannelNotification(msg: RemoteChannelMessage, localHost: s
   add("origin_host", msg.originHost);
   add("origin_ts", msg.originTs);
   return {
-    content: withSenderPrefix(msg.fromAgent, msg.originHost, msg.content, localHost),
+    content: withSenderPrefix("ch", msg.fromAgent, msg.originHost, msg.originTs, msg.content, localHost),
     meta,
   };
 }
@@ -65,7 +78,7 @@ export function buildDmNotification(msg: RemoteDirectMessage, localHost: string)
   add("origin_host", msg.originHost);
   add("origin_ts", msg.originTs);
   return {
-    content: withSenderPrefix(msg.fromAgent, msg.originHost, msg.content, localHost),
+    content: withSenderPrefix("dm", msg.fromAgent, msg.originHost, msg.originTs, msg.content, localHost),
     meta,
   };
 }
@@ -77,7 +90,7 @@ export function buildBroadcastNotification(msg: RemoteBroadcastMessage, localHos
   add("origin_host", msg.originHost);
   add("origin_ts", msg.originTs);
   return {
-    content: withSenderPrefix(msg.fromAgent, msg.originHost, msg.content, localHost),
+    content: withSenderPrefix("bcast", msg.fromAgent, msg.originHost, msg.originTs, msg.content, localHost),
     meta,
   };
 }

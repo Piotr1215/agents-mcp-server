@@ -245,7 +245,7 @@ server.registerTool(
       logToFile("DM", `${name} -> ${to}: ${message}`);
 
       natsTransport.publishDirectMessage(to, name, message);
-      return `DM published to '${to}' over NATS. Live delivery happens if the recipient session has comms_bind active.`;
+      return `DM published to '${to}' over NATS. Live delivery happens when the recipient session is registered; otherwise the message stays in dm_history for catch-up.`;
     });
   }
 );
