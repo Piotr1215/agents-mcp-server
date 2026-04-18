@@ -1,6 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { NatsTransport, PresenceBeat } from "../src/nats.js";
+import { NatsTransport, PresenceBeat, RemoteChannelMessage } from "../src/nats.js";
 import type { NatsConnection, Subscription, Msg } from "nats";
+
+// NATS-style wildcard: "a.b.*" matches "a.b.X" but not "a.b" or "a.b.X.Y".
+function subjectMatches(pattern: string, subject: string): boolean {
+  const p = pattern.split(".");
+  const s = subject.split(".");
+  if (p.length !== s.length) return false;
+  return p.every((tok, i) => tok === "*" || tok === s[i]);
+}
 
 class FakeBus {
   private subs: Array<(subject: string, data: Uint8Array) => void> = [];
@@ -48,7 +56,7 @@ function fakeConnection(bus: FakeBus): NatsConnection {
     };
 
     bus.subscribe((subj, data) => {
-      if (subj !== subject) return;
+      if (!subjectMatches(subject, subj)) return;
       push({
         subject: subj,
         data,
@@ -213,5 +221,113 @@ describe("NatsTransport", () => {
     expect(t.getRemotePeers()).toHaveLength(0);
     errSpy.mockRestore();
     await t.close();
+  });
+
+  describe("channel pub/sub", () => {
+    it("publishes to agents.channel.<base64url> with origin metadata", async () => {
+      const seen: Array<{ subject: string; payload: any }> = [];
+      bus.subscribe((subject, data) => {
+        if (subject.startsWith("agents.channel.")) {
+          seen.push({ subject, payload: JSON.parse(Buffer.from(data).toString("utf-8")) });
+        }
+      });
+      const t = new NatsTransport({
+        url: "fake",
+        host: "host-a",
+        connector: async () => fakeConnection(bus),
+        now: () => 42,
+      });
+      await t.start();
+      t.publishChannelMessage("#eng", "alice-abc", "hello");
+      expect(seen).toHaveLength(1);
+      const expectedSubject = "agents.channel." + Buffer.from("#eng", "utf-8").toString("base64url");
+      expect(seen[0].subject).toBe(expectedSubject);
+      expect(seen[0].payload).toMatchObject({
+        channel: "#eng",
+        from_agent: "alice-abc",
+        content: "hello",
+        origin_host: "host-a",
+        origin_ts: 42,
+      });
+      await t.close();
+    });
+
+    it("delivers remote channel messages via onChannelMessage callback", async () => {
+      const received: RemoteChannelMessage[] = [];
+      const recv = new NatsTransport({
+        url: "fake",
+        host: "host-b",
+        onChannelMessage: (m) => { received.push(m); },
+        connector: async () => fakeConnection(bus),
+        now: () => 100,
+      });
+      await recv.start();
+
+      const sender = new NatsTransport({
+        url: "fake",
+        host: "host-a",
+        connector: async () => fakeConnection(bus),
+        now: () => 50,
+      });
+      await sender.start();
+      sender.publishChannelMessage("#eng", "alice-abc", "hi from A");
+
+      await new Promise((r) => setTimeout(r, 10));
+      expect(received).toHaveLength(1);
+      expect(received[0]).toMatchObject({
+        channel: "#eng",
+        fromAgent: "alice-abc",
+        content: "hi from A",
+        originHost: "host-a",
+        originTs: 50,
+      });
+      await sender.close();
+      await recv.close();
+    });
+
+    it("skips own-host echoes in receive loop", async () => {
+      const received: RemoteChannelMessage[] = [];
+      const t = new NatsTransport({
+        url: "fake",
+        host: "host-a",
+        onChannelMessage: (m) => { received.push(m); },
+        connector: async () => fakeConnection(bus),
+        now: () => 1_000,
+      });
+      await t.start();
+      t.publishChannelMessage("#eng", "alice-abc", "loopback-test");
+      await new Promise((r) => setTimeout(r, 10));
+      expect(received).toHaveLength(0);
+      await t.close();
+    });
+
+    it("drops channel payloads missing required fields", async () => {
+      const received: RemoteChannelMessage[] = [];
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const t = new NatsTransport({
+        url: "fake",
+        host: "host-b",
+        onChannelMessage: (m) => { received.push(m); },
+        connector: async () => fakeConnection(bus),
+        now: () => 1_000,
+      });
+      await t.start();
+      const subject = "agents.channel." + Buffer.from("#eng", "utf-8").toString("base64url");
+      bus.publish(subject, Buffer.from(JSON.stringify({ channel: "#eng", content: "" })));
+      bus.publish(subject, Buffer.from("{not valid json"));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(received).toHaveLength(0);
+      expect(errSpy).toHaveBeenCalled();
+      errSpy.mockRestore();
+      await t.close();
+    });
+
+    it("is a no-op when publishChannelMessage is called before start()", () => {
+      const t = new NatsTransport({
+        url: "fake",
+        connector: async () => fakeConnection(bus),
+      });
+      expect(() => t.publishChannelMessage("#eng", "alice", "hi")).not.toThrow();
+    });
   });
 });
