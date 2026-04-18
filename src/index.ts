@@ -347,8 +347,10 @@ server.registerTool(
       const sender = await db.getAgentByName(name);
       const senderId = sender?.id || name;
 
-      await db.logMessage("CHANNEL", senderId, null, channel, message);
+      await db.logMessage("CHANNEL", senderId, null, channel, message, natsTransport?.getHost() ?? null);
       logToFile("CHANNEL", `#${channel} ${name}: ${message}`);
+
+      if (natsTransport) natsTransport.publishChannelMessage(channel, senderId, message);
 
       return `Message logged to #${channel}`;
     });
@@ -601,7 +603,22 @@ async function main() {
   await db.getDb(); // Initialize DB
   const natsUrl = process.env.AGENTS_NATS_URL;
   if (natsUrl) {
-    natsTransport = await initNatsTransport({ url: natsUrl });
+    natsTransport = await initNatsTransport({
+      url: natsUrl,
+      onChannelMessage: async (msg) => {
+        try {
+          await db.insertReplicatedChannelMessage({
+            channel: msg.channel,
+            fromAgent: msg.fromAgent,
+            content: msg.content,
+            originHost: msg.originHost,
+          });
+          logToFile("CHANNEL", `#${msg.channel} ${msg.fromAgent}@${msg.originHost}: ${msg.content}`);
+        } catch (err) {
+          console.error("[nats] channel replicate failed:", err);
+        }
+      },
+    });
   }
   const transport = new StdioServerTransport();
   await server.connect(transport);

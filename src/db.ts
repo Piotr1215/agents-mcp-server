@@ -68,8 +68,10 @@ function initSchema(): void {
       from_agent VARCHAR,
       to_agent VARCHAR,
       channel VARCHAR,
-      content TEXT
+      content TEXT,
+      origin_host VARCHAR
     );
+    ALTER TABLE messages ADD COLUMN IF NOT EXISTS origin_host VARCHAR;
     CREATE TABLE IF NOT EXISTS tool_metrics (
       id INTEGER PRIMARY KEY,
       timestamp TIMESTAMP DEFAULT now(),
@@ -148,13 +150,22 @@ export async function getAgentByName(name: string): Promise<Agent | null> {
   return rows[0] as Agent || null;
 }
 
-export async function logMessage(type: string, from: string | null, to: string | null, channel: string | null, content: string): Promise<number> {
+export async function logMessage(type: string, from: string | null, to: string | null, channel: string | null, content: string, originHost: string | null = null): Promise<number> {
   initSchema();
   const idResult = dbQuery(`SELECT nextval('msg_seq') as id`);
   const rows = JSON.parse(idResult || "[]");
   const id = rows[0]?.id ?? Date.now();
-  dbExec(`INSERT INTO messages (id, type, from_agent, to_agent, channel, content) VALUES (${id}, '${esc(type)}', ${from ? `'${esc(from)}'` : 'NULL'}, ${to ? `'${esc(to)}'` : 'NULL'}, ${channel ? `'${esc(channel)}'` : 'NULL'}, '${esc(content)}')`);
+  dbExec(`INSERT INTO messages (id, type, from_agent, to_agent, channel, content, origin_host) VALUES (${id}, '${esc(type)}', ${from ? `'${esc(from)}'` : 'NULL'}, ${to ? `'${esc(to)}'` : 'NULL'}, ${channel ? `'${esc(channel)}'` : 'NULL'}, '${esc(content)}', ${originHost ? `'${esc(originHost)}'` : 'NULL'})`);
   return id;
+}
+
+export async function insertReplicatedChannelMessage(params: {
+  channel: string;
+  fromAgent: string;
+  content: string;
+  originHost: string;
+}): Promise<number> {
+  return logMessage("CHANNEL", params.fromAgent, null, params.channel, params.content, params.originHost);
 }
 
 export async function getChannelHistory(channel: string, limit = 50): Promise<Message[]> {
