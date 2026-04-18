@@ -168,6 +168,22 @@ export async function insertReplicatedChannelMessage(params: {
   return logMessage("CHANNEL", params.fromAgent, null, params.channel, params.content, params.originHost);
 }
 
+export async function insertReplicatedDm(params: {
+  toAgent: string;
+  fromAgent: string;
+  content: string;
+  originHost: string;
+}): Promise<number> {
+  // Resolve both sides to their canonical agent_id when known so dm_history
+  // joins the rows to their agents; fall back to the name when the peer
+  // isn't in our local registry (remote-only agent).
+  const from = await getAgentByName(params.fromAgent);
+  const to = await getAgentByName(params.toAgent);
+  const fromId = from?.id || params.fromAgent;
+  const toId = to?.id || params.toAgent;
+  return logMessage("DM", fromId, toId, null, params.content, params.originHost);
+}
+
 export async function getChannelHistory(channel: string, limit = 50): Promise<Message[]> {
   initSchema();
   const result = dbQuery(`SELECT * FROM messages WHERE channel = '${esc(channel)}' ORDER BY timestamp DESC LIMIT ${limit}`);

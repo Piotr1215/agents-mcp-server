@@ -247,24 +247,37 @@ server.registerTool(
       }
 
       const target = await db.getAgentByName(to);
-      if (!target || !target.id) {
+      const localReachable = !!(target && target.id && (target.pane_id || target.stable_pane));
+      const remotePeer = natsTransport?.getRemotePeers().find(p => p.name === to);
+
+      if (!localReachable && !remotePeer) {
         const agents = await db.getAgents();
-        const names = agents.filter(a => a && a.name).map(a => a.name).join(", ");
-        return `Error: Agent '${to}' not found. Active agents: ${names || "none"}. Use agent_discover() to refresh.`;
+        const localNames = agents.filter(a => a && a.name).map(a => a.name);
+        const remoteNames = natsTransport?.getRemotePeers().map(p => p.name) ?? [];
+        const allNames = [...localNames, ...remoteNames].join(", ");
+        return `Error: Agent '${to}' not reachable. Active agents: ${allNames || "none"}. Use agent_discover() to refresh.`;
       }
-      if (!target.pane_id && !target.stable_pane) return `Error: Agent '${to}' has no tmux pane (may have disconnected). Use agent_discover() to see active agents.`;
 
-      await db.logMessage("DM", sender.id, target.id, null, message);
-      logToFile("DM", `${name} -> ${target.name}: ${message}`);
+      const targetId = target?.id || to;
+      await db.logMessage("DM", sender.id, targetId, null, message, natsTransport?.getHost() ?? null);
+      logToFile("DM", `${name} -> ${to}: ${message}`);
 
-      const formattedMsg = `[DM from ${name}] ${message}`;
-
-      try {
-        await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
-        return `DM sent to ${target.name}`;
-      } catch (err) {
-        return `Failed to send DM: ${err}`;
+      if (localReachable && target) {
+        const formattedMsg = `[DM from ${name}] ${message}`;
+        try {
+          await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
+          return `DM sent to ${target.name}`;
+        } catch (err) {
+          return `Failed to send DM locally: ${err}`;
+        }
       }
+
+      if (natsTransport) {
+        natsTransport.publishDirectMessage(to, name, message);
+        return `DM sent to ${to} via NATS (remote host: ${remotePeer?.host ?? "unknown"})`;
+      }
+
+      return `Error: Agent '${to}' only reachable remotely and NATS transport is not configured.`;
     });
   }
 );
@@ -616,6 +629,19 @@ async function main() {
           logToFile("CHANNEL", `#${msg.channel} ${msg.fromAgent}@${msg.originHost}: ${msg.content}`);
         } catch (err) {
           console.error("[nats] channel replicate failed:", err);
+        }
+      },
+      onDirectMessage: async (msg) => {
+        try {
+          await db.insertReplicatedDm({
+            toAgent: msg.toAgent,
+            fromAgent: msg.fromAgent,
+            content: msg.content,
+            originHost: msg.originHost,
+          });
+          logToFile("DM", `${msg.fromAgent}@${msg.originHost} -> ${msg.toAgent}: ${msg.content}`);
+        } catch (err) {
+          console.error("[nats] dm replicate failed:", err);
         }
       },
     });
