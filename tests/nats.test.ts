@@ -652,4 +652,110 @@ describe("NatsTransport", () => {
       await recv.close();
     });
   });
+
+  describe("reconnect resurrection (#120)", () => {
+    // A fake connection that exposes a controllable status() stream.
+    // Returns the nc plus an `emit` function the test uses to inject
+    // "disconnect"/"reconnect" events as if nats.js had seen them.
+    function statefulFake(bus: FakeBus): {
+      nc: NatsConnection;
+      emit: (event: { type: string; data?: unknown }) => void;
+      endStatus: () => void;
+    } {
+      const base = fakeConnection(bus);
+      const pending: Array<{ type: string; data?: unknown }> = [];
+      let resolveNext: ((v: IteratorResult<{ type: string; data?: unknown }>) => void) | null = null;
+      let ended = false;
+      const iter: AsyncIterable<{ type: string; data?: unknown }> = {
+        [Symbol.asyncIterator]() {
+          return {
+            next(): Promise<IteratorResult<{ type: string; data?: unknown }>> {
+              if (pending.length) return Promise.resolve({ value: pending.shift()!, done: false });
+              if (ended) return Promise.resolve({ value: undefined as never, done: true });
+              return new Promise((resolve) => { resolveNext = resolve; });
+            },
+          };
+        },
+      };
+      const nc = Object.assign(base, {
+        status: () => iter,
+      }) as unknown as NatsConnection;
+      const emit = (event: { type: string; data?: unknown }) => {
+        if (resolveNext) {
+          const r = resolveNext;
+          resolveNext = null;
+          r({ value: event, done: false });
+        } else {
+          pending.push(event);
+        }
+      };
+      const endStatus = () => {
+        ended = true;
+        if (resolveNext) {
+          const r = resolveNext;
+          resolveNext = null;
+          r({ value: undefined as never, done: true });
+        }
+      };
+      return { nc, emit, endStatus };
+    }
+
+    it("resubscribes after a reconnect event so inbound DMs still deliver", async () => {
+      const received: RemoteDirectMessage[] = [];
+      const { nc, emit, endStatus } = statefulFake(bus);
+      const recv = new NatsTransport({
+        url: "fake",
+        host: "host-b",
+        onDirectMessage: (m) => { received.push(m); },
+        connector: async () => nc,
+        now: () => 100,
+      });
+      await recv.start();
+
+      // Pre-reconnect DM delivers normally.
+      const subject = "agents.dm." + Buffer.from("bob", "utf-8").toString("base64url");
+      bus.publish(subject, Buffer.from(JSON.stringify({
+        to_agent: "bob",
+        from_agent: "alice",
+        content: "before",
+        origin_host: "host-a",
+        origin_ts: 50,
+      })));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(received).toHaveLength(1);
+
+      // Simulate the broker flap: disconnect, then reconnect. The transport
+      // must re-establish its four wildcard subscriptions so that post-
+      // reconnect messages keep arriving.
+      emit({ type: "disconnect" });
+      emit({ type: "reconnect" });
+      await new Promise((r) => setTimeout(r, 10));
+
+      bus.publish(subject, Buffer.from(JSON.stringify({
+        to_agent: "bob",
+        from_agent: "alice",
+        content: "after",
+        origin_host: "host-a",
+        origin_ts: 60,
+      })));
+      await new Promise((r) => setTimeout(r, 10));
+      // If resubscribe had not fired we'd see 1 here; the second delivery is
+      // the proof that the consume loop survived the flap.
+      expect(received.map((m) => m.content)).toEqual(["before", "after"]);
+
+      endStatus();
+      await recv.close();
+    });
+
+    it("does not crash when the connection has no status() method (legacy fakes)", async () => {
+      const t = new NatsTransport({
+        url: "fake",
+        host: "host-a",
+        connector: async () => fakeConnection(bus),
+        now: () => 1_000,
+      });
+      await expect(t.start()).resolves.not.toThrow();
+      await t.close();
+    });
+  });
 });
