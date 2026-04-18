@@ -10,9 +10,12 @@ import { randomBytes } from "crypto";
 import { z } from "zod";
 import { appendFileSync } from "fs";
 import * as db from "./db.js";
+import { initNatsTransport, NatsTransport } from "./nats.js";
 
 const SND_PATH = process.env.SND_PATH || "/home/decoder/.claude/scripts/snd";
 const LOG_FILE = "/tmp/agent_messages.log";
+
+let natsTransport: NatsTransport | null = null;
 
 function logToFile(type: string, content: string): void {
   const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
@@ -98,9 +101,18 @@ server.registerTool(
       await db.registerAgent(agentId, name, groupName, existing?.pane_id || "");
 
       const allAgents = await db.getAgents(groupName);
-      const peers = allAgents
+      const peers: Array<{ name: string; group: string; host?: string }> = allAgents
         .filter(a => a && a.name && a.name !== name)
         .map(a => ({ name: a.name, group: a.group_name }));
+
+      if (natsTransport) {
+        const localAgent = { agent_id: agentId, name, group: groupName };
+        natsTransport.trackLocal(localAgent);
+        await natsTransport.publishBeat(localAgent);
+        for (const beat of natsTransport.getRemotePeers(groupName)) {
+          peers.push({ name: beat.name, group: beat.group, host: beat.host });
+        }
+      }
 
       return JSON.stringify({
         agent_id: agentId,
@@ -143,6 +155,7 @@ server.registerTool(
       };
       await db.deregisterAgent(agent.id);
       await db.logMessage("LEFT", agent.id, null, agent.group_name || "default", `${agent.name} left`);
+      if (natsTransport) natsTransport.untrackLocal(agent.id);
       return JSON.stringify({
         success: true,
         ...agentInfo,
@@ -272,17 +285,23 @@ server.registerTool(
     return withMetrics("agent_discover", async () => {
       const agents = await db.getAgents(group || undefined);
       const validAgents = agents.filter(a => a && a.id && a.name);
+      const remotePeers = natsTransport ? natsTransport.getRemotePeers(group || undefined) : [];
 
-      if (validAgents.length === 0) {
+      if (validAgents.length === 0 && remotePeers.length === 0) {
         return group ? `No agents in group '${group}'` : "No agents currently registered.";
       }
 
-      const lines = validAgents.map(a =>
-        `- ${a.name} (${a.id}): active | group: ${a.group_name || "default"} | pane: ${a.pane_id || "unknown"}`
+      const localHost = natsTransport ? natsTransport.getHost() : "local";
+      const localLines = validAgents.map(a =>
+        `- ${a.name} (${a.id}): active | group: ${a.group_name || "default"} | host: ${localHost} | pane: ${a.pane_id || "unknown"}`
+      );
+      const remoteLines = remotePeers.map(p =>
+        `- ${p.name} (${p.agent_id}): active | group: ${p.group} | host: ${p.host} | remote`
       );
 
+      const lines = [...localLines, ...remoteLines];
       const groupInfo = group ? ` in group '${group}'` : "";
-      return `Active agents (${validAgents.length})${groupInfo}:\n${lines.join("\n")}`;
+      return `Active agents (${lines.length})${groupInfo}:\n${lines.join("\n")}`;
     });
   }
 );
@@ -580,9 +599,17 @@ server.registerTool(
 
 async function main() {
   await db.getDb(); // Initialize DB
+  const natsUrl = process.env.AGENTS_NATS_URL;
+  if (natsUrl) {
+    natsTransport = await initNatsTransport({ url: natsUrl });
+  }
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Agents MCP Server v3.0.0 (McpServer + DuckDB) running");
+  const natsStatus = natsTransport ? ` + NATS@${natsTransport.getHost()}` : "";
+  console.error(`Agents MCP Server v3.1.0 (McpServer + DuckDB${natsStatus}) running`);
 }
 
 main().catch(console.error);
+
+process.on("SIGTERM", async () => { await natsTransport?.close(); process.exit(0); });
+process.on("SIGINT",  async () => { await natsTransport?.close(); process.exit(0); });
