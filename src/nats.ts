@@ -25,12 +25,21 @@ export interface RemoteChannelMessage {
   originTs: number;
 }
 
+export interface RemoteDirectMessage {
+  toAgent: string;
+  fromAgent: string;
+  content: string;
+  originHost: string;
+  originTs: number;
+}
+
 export interface NatsTransportConfig {
   url: string;
   host?: string;
   heartbeatMs?: number;
   peerTtlMs?: number;
   onChannelMessage?: (msg: RemoteChannelMessage) => void | Promise<void>;
+  onDirectMessage?: (msg: RemoteDirectMessage) => void | Promise<void>;
   connector?: (url: string) => Promise<NatsConnection>;
   now?: () => number;
 }
@@ -44,6 +53,8 @@ export interface LocalAgent {
 const PRESENCE_SUBJECT = "agents.presence";
 const CHANNEL_SUBJECT_PREFIX = "agents.channel.";
 const CHANNEL_SUBJECT_WILDCARD = "agents.channel.*";
+const DM_SUBJECT_PREFIX = "agents.dm.";
+const DM_SUBJECT_WILDCARD = "agents.dm.*";
 const DEFAULT_HEARTBEAT_MS = 10_000;
 const DEFAULT_PEER_TTL_MS = 30_000;
 
@@ -51,6 +62,12 @@ const DEFAULT_PEER_TTL_MS = 30_000;
 // (e.g. "#eng"). Base64url keeps the mapping reversible and ASCII-safe.
 function channelToSubject(channel: string): string {
   return CHANNEL_SUBJECT_PREFIX + Buffer.from(channel, "utf-8").toString("base64url");
+}
+
+// Agent names are usually subject-safe already, but users can pick anything.
+// Encode to the same canonical form for consistency with channels.
+function dmToSubject(toAgent: string): string {
+  return DM_SUBJECT_PREFIX + Buffer.from(toAgent, "utf-8").toString("base64url");
 }
 
 export class NatsTransport {
@@ -61,14 +78,17 @@ export class NatsTransport {
   private readonly now: () => number;
   private readonly connector: (url: string) => Promise<NatsConnection>;
   private readonly onChannelMessage: (msg: RemoteChannelMessage) => void | Promise<void>;
+  private readonly onDirectMessage: (msg: RemoteDirectMessage) => void | Promise<void>;
   private readonly peers = new Map<string, PresenceBeat>();
   private readonly locals = new Map<string, LocalAgent>();
   private nc: NatsConnection | null = null;
   private presenceSub: Subscription | null = null;
   private channelSub: Subscription | null = null;
+  private dmSub: Subscription | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private presenceLoop: Promise<void> | null = null;
   private channelLoop: Promise<void> | null = null;
+  private dmLoop: Promise<void> | null = null;
   private closed = false;
 
   constructor(config: NatsTransportConfig) {
@@ -78,6 +98,7 @@ export class NatsTransport {
     this.peerTtlMs = config.peerTtlMs ?? DEFAULT_PEER_TTL_MS;
     this.now = config.now ?? (() => Date.now());
     this.onChannelMessage = config.onChannelMessage ?? (() => {});
+    this.onDirectMessage = config.onDirectMessage ?? (() => {});
     this.connector = config.connector ?? (async (url) => {
       const nats = await import("nats");
       return nats.connect({ servers: url, name: `agents-mcp@${this.host}` });
@@ -90,6 +111,8 @@ export class NatsTransport {
     this.presenceLoop = this.consumePresence(this.presenceSub);
     this.channelSub = this.nc.subscribe(CHANNEL_SUBJECT_WILDCARD);
     this.channelLoop = this.consumeChannel(this.channelSub);
+    this.dmSub = this.nc.subscribe(DM_SUBJECT_WILDCARD);
+    this.dmLoop = this.consumeDm(this.dmSub);
     this.heartbeatTimer = setInterval(() => {
       this.publishAll().catch((err) => console.error("[nats] heartbeat failed:", err));
     }, this.heartbeatMs);
@@ -137,6 +160,18 @@ export class NatsTransport {
     this.nc.publish(channelToSubject(channel), Buffer.from(JSON.stringify(payload)));
   }
 
+  publishDirectMessage(toAgent: string, fromAgent: string, content: string): void {
+    if (!this.nc || this.closed) return;
+    const payload = {
+      to_agent: toAgent,
+      from_agent: fromAgent,
+      content,
+      origin_host: this.host,
+      origin_ts: this.now(),
+    };
+    this.nc.publish(dmToSubject(toAgent), Buffer.from(JSON.stringify(payload)));
+  }
+
   getRemotePeers(group?: string): PresenceBeat[] {
     const cutoff = this.now() - this.peerTtlMs;
     const result: PresenceBeat[] = [];
@@ -162,16 +197,18 @@ export class NatsTransport {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
-    for (const sub of [this.presenceSub, this.channelSub]) {
+    for (const sub of [this.presenceSub, this.channelSub, this.dmSub]) {
       if (sub) sub.unsubscribe();
     }
     this.presenceSub = null;
     this.channelSub = null;
-    for (const loop of [this.presenceLoop, this.channelLoop]) {
+    this.dmSub = null;
+    for (const loop of [this.presenceLoop, this.channelLoop, this.dmLoop]) {
       if (loop) { try { await loop; } catch { /* drained */ } }
     }
     this.presenceLoop = null;
     this.channelLoop = null;
+    this.dmLoop = null;
     if (this.nc) {
       await this.nc.drain().catch(() => { /* best-effort */ });
       this.nc = null;
@@ -221,6 +258,35 @@ export class NatsTransport {
         });
       } catch (err) {
         console.error("[nats] bad channel payload:", err);
+      }
+    }
+  }
+
+  private async consumeDm(sub: Subscription): Promise<void> {
+    for await (const msg of sub) {
+      try {
+        const raw = JSON.parse(Buffer.from(msg.data).toString("utf-8")) as {
+          to_agent?: string;
+          from_agent?: string;
+          content?: string;
+          origin_host?: string;
+          origin_ts?: number;
+        };
+        if (!raw.to_agent || !raw.from_agent || !raw.content || !raw.origin_host) {
+          console.error("[nats] bad dm payload: missing fields");
+          continue;
+        }
+        // Skip our own echoes — publishing host already delivered locally.
+        if (raw.origin_host === this.host) continue;
+        await this.onDirectMessage({
+          toAgent: raw.to_agent,
+          fromAgent: raw.from_agent,
+          content: raw.content,
+          originHost: raw.origin_host,
+          originTs: raw.origin_ts ?? this.now(),
+        });
+      } catch (err) {
+        console.error("[nats] bad dm payload:", err);
       }
     }
   }

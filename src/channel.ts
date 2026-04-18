@@ -11,7 +11,7 @@
 // required; the server exits loudly if either is missing.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { initNatsTransport, NatsTransport, RemoteChannelMessage } from "./nats.js";
+import { initNatsTransport, NatsTransport, RemoteChannelMessage, RemoteDirectMessage } from "./nats.js";
 
 const CHANNEL_METHOD = "notifications/claude/channel";
 
@@ -29,13 +29,26 @@ export interface ChannelNotificationParams {
 }
 
 export function buildChannelNotification(msg: RemoteChannelMessage): ChannelNotificationParams {
-  const meta: Record<string, string> = {};
+  const meta: Record<string, string> = { kind: "channel" };
   const add = (k: string, v: string | number | undefined) => {
     if (v === undefined || v === null) return;
     meta[sanitizeMetaKey(k)] = String(v);
   };
   add("channel", msg.channel);
   add("from_agent", msg.fromAgent);
+  add("origin_host", msg.originHost);
+  add("origin_ts", msg.originTs);
+  return { content: msg.content, meta };
+}
+
+export function buildDmNotification(msg: RemoteDirectMessage): ChannelNotificationParams {
+  const meta: Record<string, string> = { kind: "dm" };
+  const add = (k: string, v: string | number | undefined) => {
+    if (v === undefined || v === null) return;
+    meta[sanitizeMetaKey(k)] = String(v);
+  };
+  add("from_agent", msg.fromAgent);
+  add("to_agent", msg.toAgent);
   add("origin_host", msg.originHost);
   add("origin_ts", msg.originTs);
   return { content: msg.content, meta };
@@ -73,6 +86,18 @@ async function main(): Promise<void> {
         await mcp.server.notification({ method: CHANNEL_METHOD, params });
       } catch (err) {
         console.error("[channel] emit failed:", err instanceof Error ? err.message : err);
+      }
+    },
+    onDirectMessage: async (msg: RemoteDirectMessage) => {
+      // DMs are private — only push if the message is addressed to the agent
+      // this session represents. Without this filter every host's session
+      // would see every host's DMs.
+      if (msg.toAgent !== agentName) return;
+      try {
+        const params = buildDmNotification(msg);
+        await mcp.server.notification({ method: CHANNEL_METHOD, params });
+      } catch (err) {
+        console.error("[channel] dm emit failed:", err instanceof Error ? err.message : err);
       }
     },
   });
