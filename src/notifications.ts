@@ -65,6 +65,7 @@ export function buildChannelNotification(msg: RemoteChannelMessage, localHost: s
   add("from_agent", msg.fromAgent);
   add("origin_host", msg.originHost);
   add("origin_ts", msg.originTs);
+  add("origin_seq", msg.originSeq);
   return {
     content: withSenderPrefix("ch", msg.fromAgent, msg.originHost, msg.originTs, msg.content, localHost),
     meta,
@@ -77,6 +78,7 @@ export function buildDmNotification(msg: RemoteDirectMessage, localHost: string)
   add("to_agent", msg.toAgent);
   add("origin_host", msg.originHost);
   add("origin_ts", msg.originTs);
+  add("origin_seq", msg.originSeq);
   return {
     content: withSenderPrefix("dm", msg.fromAgent, msg.originHost, msg.originTs, msg.content, localHost),
     meta,
@@ -89,6 +91,7 @@ export function buildBroadcastNotification(msg: RemoteBroadcastMessage, localHos
   add("group", msg.group);
   add("origin_host", msg.originHost);
   add("origin_ts", msg.originTs);
+  add("origin_seq", msg.originSeq);
   return {
     content: withSenderPrefix("bcast", msg.fromAgent, msg.originHost, msg.originTs, msg.content, localHost),
     meta,

@@ -23,6 +23,7 @@ export interface RemoteChannelMessage {
   content: string;
   originHost: string;
   originTs: number;
+  originSeq: number;
 }
 
 export interface RemoteDirectMessage {
@@ -31,6 +32,7 @@ export interface RemoteDirectMessage {
   content: string;
   originHost: string;
   originTs: number;
+  originSeq: number;
 }
 
 export interface RemoteBroadcastMessage {
@@ -39,6 +41,7 @@ export interface RemoteBroadcastMessage {
   content: string;
   originHost: string;
   originTs: number;
+  originSeq: number;
 }
 
 export interface NatsTransportConfig {
@@ -98,6 +101,13 @@ export class NatsTransport {
   private readonly onBroadcast: (msg: RemoteBroadcastMessage) => void | Promise<void>;
   private readonly peers = new Map<string, PresenceBeat>();
   private readonly locals = new Map<string, LocalAgent>();
+  // Monotonic per-process sequence. Breaks ties when two publishes land in
+  // the same millisecond — consumers can sort by (origin_ts, origin_seq) for
+  // deterministic ordering within a single publisher. Cross-host ordering is
+  // out of scope: each host maintains its own counter. Resets to 0 on process
+  // restart; durability across restarts would need a persisted counter or a
+  // global broker sequence, neither of which is required for tie-breaking.
+  private seq: number = 0;
   private nc: NatsConnection | null = null;
   private presenceSub: Subscription | null = null;
   private channelSub: Subscription | null = null;
@@ -178,6 +188,7 @@ export class NatsTransport {
       content,
       origin_host: this.host,
       origin_ts: this.now(),
+      origin_seq: this.seq++,
     };
     this.nc.publish(channelToSubject(channel), Buffer.from(JSON.stringify(payload)));
   }
@@ -190,6 +201,7 @@ export class NatsTransport {
       content,
       origin_host: this.host,
       origin_ts: this.now(),
+      origin_seq: this.seq++,
     };
     this.nc.publish(dmToSubject(toAgent), Buffer.from(JSON.stringify(payload)));
   }
@@ -202,6 +214,7 @@ export class NatsTransport {
       content,
       origin_host: this.host,
       origin_ts: this.now(),
+      origin_seq: this.seq++,
     };
     this.nc.publish(broadcastToSubject(group), Buffer.from(JSON.stringify(payload)));
   }
@@ -282,6 +295,7 @@ export class NatsTransport {
           content?: string;
           origin_host?: string;
           origin_ts?: number;
+          origin_seq?: number;
         };
         if (!raw.channel || !raw.content || !raw.origin_host) {
           console.error("[nats] bad channel payload: missing fields");
@@ -295,6 +309,7 @@ export class NatsTransport {
           content: raw.content,
           originHost: raw.origin_host,
           originTs: raw.origin_ts ?? this.now(),
+          originSeq: raw.origin_seq ?? 0,
         });
       } catch (err) {
         console.error("[nats] bad channel payload:", err);
@@ -311,6 +326,7 @@ export class NatsTransport {
           content?: string;
           origin_host?: string;
           origin_ts?: number;
+          origin_seq?: number;
         };
         if (!raw.to_agent || !raw.from_agent || !raw.content || !raw.origin_host) {
           console.error("[nats] bad dm payload: missing fields");
@@ -324,6 +340,7 @@ export class NatsTransport {
           content: raw.content,
           originHost: raw.origin_host,
           originTs: raw.origin_ts ?? this.now(),
+          originSeq: raw.origin_seq ?? 0,
         });
       } catch (err) {
         console.error("[nats] bad dm payload:", err);
@@ -340,6 +357,7 @@ export class NatsTransport {
           content?: string;
           origin_host?: string;
           origin_ts?: number;
+          origin_seq?: number;
         };
         if (!raw.group || !raw.from_agent || !raw.content || !raw.origin_host) {
           console.error("[nats] bad broadcast payload: missing fields");
@@ -352,6 +370,7 @@ export class NatsTransport {
           content: raw.content,
           originHost: raw.origin_host,
           originTs: raw.origin_ts ?? this.now(),
+          originSeq: raw.origin_seq ?? 0,
         });
       } catch (err) {
         console.error("[nats] bad broadcast payload:", err);
