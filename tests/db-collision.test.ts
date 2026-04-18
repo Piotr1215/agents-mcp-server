@@ -92,20 +92,23 @@ describe("DB registration collision (real DuckDB)", () => {
     dbExec("CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_name ON agents(name)");
 
     // First registration
-    dbExec("INSERT INTO agents (id, name, group_name, pane_id, registered_at) VALUES ('dev-abc', 'dev', 'evening', '%4', now()) ON CONFLICT(name) DO UPDATE SET id = EXCLUDED.id, group_name = EXCLUDED.group_name, pane_id = EXCLUDED.pane_id, registered_at = EXCLUDED.registered_at");
+    dbExec("INSERT INTO agents (id, name, group_name, pane_id, registered_at) VALUES ('dev-abc', 'dev', 'evening', '%4', now()) ON CONFLICT(name) DO UPDATE SET group_name = EXCLUDED.group_name, pane_id = EXCLUDED.pane_id, registered_at = EXCLUDED.registered_at");
 
     const found = dbQuery("SELECT * FROM agents WHERE name = 'dev'");
     expect(found).toHaveLength(1);
     expect(found[0].pane_id).toBe("%4");
     expect(found[0].registered_at).not.toBeNull();
 
-    // Re-registration updates the row (new pane, same name)
-    dbExec("INSERT INTO agents (id, name, group_name, pane_id, registered_at) VALUES ('dev-xyz', 'dev', 'evening', '%9', now()) ON CONFLICT(name) DO UPDATE SET id = EXCLUDED.id, group_name = EXCLUDED.group_name, pane_id = EXCLUDED.pane_id, registered_at = EXCLUDED.registered_at");
+    // Re-registration updates the row (new pane, same name). Post-#27 the
+    // UPSERT no longer reassigns id — DuckDB 1.1.3 rejects SET on a PK column.
+    // Production reuses the existing id (src/index.ts:110), so id is stable
+    // across re-register.
+    dbExec("INSERT INTO agents (id, name, group_name, pane_id, registered_at) VALUES ('dev-xyz', 'dev', 'evening', '%9', now()) ON CONFLICT(name) DO UPDATE SET group_name = EXCLUDED.group_name, pane_id = EXCLUDED.pane_id, registered_at = EXCLUDED.registered_at");
 
     const updated = dbQuery("SELECT * FROM agents WHERE name = 'dev'");
     expect(updated).toHaveLength(1);
     expect(updated[0].pane_id).toBe("%9");
-    expect(updated[0].id).toBe("dev-xyz");
+    expect(updated[0].id).toBe("dev-abc");
   });
 
   it("ON CONFLICT(name) does not clobber other agents", () => {
@@ -114,8 +117,9 @@ describe("DB registration collision (real DuckDB)", () => {
     dbExec("INSERT INTO agents (id, name, group_name, pane_id) VALUES ('a-1', 'alice', 'team', '%1')");
     dbExec("INSERT INTO agents (id, name, group_name, pane_id) VALUES ('b-1', 'bob', 'team', '%2')");
 
-    // Re-register alice — bob must survive
-    dbExec("INSERT INTO agents (id, name, group_name, pane_id, registered_at) VALUES ('a-2', 'alice', 'team', '%5', now()) ON CONFLICT(name) DO UPDATE SET id = EXCLUDED.id, group_name = EXCLUDED.group_name, pane_id = EXCLUDED.pane_id, registered_at = EXCLUDED.registered_at");
+    // Re-register alice — bob must survive. Post-#27 UPSERT does not
+    // reassign id (see test above).
+    dbExec("INSERT INTO agents (id, name, group_name, pane_id, registered_at) VALUES ('a-2', 'alice', 'team', '%5', now()) ON CONFLICT(name) DO UPDATE SET group_name = EXCLUDED.group_name, pane_id = EXCLUDED.pane_id, registered_at = EXCLUDED.registered_at");
 
     const all = dbQuery("SELECT name, pane_id FROM agents ORDER BY name");
     expect(all).toHaveLength(2);
