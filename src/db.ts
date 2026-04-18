@@ -115,7 +115,12 @@ export interface Message {
 
 export async function registerAgent(id: string, name: string, group: string): Promise<void> {
   initSchema();
-  dbExec(`INSERT INTO agents (id, name, group_name, registered_at) VALUES ('${esc(id)}', '${esc(name)}', '${esc(group)}', now()) ON CONFLICT(name) DO UPDATE SET id = EXCLUDED.id, group_name = EXCLUDED.group_name, registered_at = EXCLUDED.registered_at`);
+  // id is the PRIMARY KEY — DuckDB 1.1.3+ rejects assigning to it in an UPSERT
+  // ("Binder Error: Can not assign to column 'id' because it has a UNIQUE/
+  // PRIMARY KEY constraint"). index.ts already reuses the existing id on name
+  // conflict, so this branch never needs to update id anyway. Dropping the
+  // clause lets fresh (non-grandfathered) DuckDB installs register cleanly.
+  dbExec(`INSERT INTO agents (id, name, group_name, registered_at) VALUES ('${esc(id)}', '${esc(name)}', '${esc(group)}', now()) ON CONFLICT(name) DO UPDATE SET group_name = EXCLUDED.group_name, registered_at = EXCLUDED.registered_at`);
 }
 
 export async function deregisterAgent(id: string): Promise<Agent | null> {
