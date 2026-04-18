@@ -184,11 +184,49 @@ Analyze tool usage over time.
 
 ## How It Works
 
-1. Agents register via `agent_register` - stored in DuckDB
-2. Hook captures tmux pane_id for message delivery
-3. Broadcasts/DMs delivered via `snd --pane <target> <message>`
-4. All messages logged to DB with timestamps
-5. Metrics tracked per tool call for optimization analysis
+Three layers. The first runs standalone; the other two light up when `AGENTS_NATS_URL` is set.
+
+### Local (always on)
+
+1. Agents register via `agent_register` — stored in DuckDB.
+2. An MCP hook captures the caller's tmux `pane_id` for delivery.
+3. `agent_broadcast` and `agent_dm` are pushed via `snd --pane <target> <message>` — direct tmux keystroke injection.
+4. Every message is logged to DuckDB with timestamps; `tool_metrics` reports usage.
+
+### NATS transport (cross-host state)
+
+When `AGENTS_NATS_URL` is set, two extra things happen on the tools MCP (`build/index.js`):
+
+- **Presence**: every registered agent publishes a beat on `agents.presence` every 10s, with 30s TTL. `agent_discover` merges remote peers from the cache, tagged `host: <hostname> | remote`.
+- **Channel replication**: `channel_send` publishes to `agents.channel.<base64url(name)>` in addition to writing the local row. Every host subscribes to `agents.channel.*` and upserts incoming messages into its own DuckDB (own-host echoes filtered). `channel_history` reads from the local DB and therefore sees cross-host traffic without changes.
+
+DMs and broadcasts are not yet routed over NATS — they stay local-tmux until the next phase.
+
+### Channels source (real-time session push)
+
+`build/channel.js` is a separate stdio MCP, spawned per session via `claude --dangerously-load-development-channels server:agents-channel`. It declares the experimental `claude/channel` capability and subscribes to `agents.channel.*`. On every remote message it emits a `notifications/claude/channel` event with `{content, meta}` — Claude Code renders that as `<channel source="agents-channel" channel="…" from_agent="…" origin_host="…" origin_ts="…">body</channel>` in the live transcript. No polling, no `snd`, sub-second round-trip.
+
+### End-to-end trace
+
+```
+bob channel_send("#eng", …)         [pop-os]
+   │
+   ├──► pop-os DuckDB   (local history row)
+   │
+   └──► NATS publish agents.channel.<b64url(#eng)>
+                          │
+           ┌──────────────┴──────────────┐
+           ▼                             ▼
+  agents-mcp-server (tools)     agents-channel (source)
+  on serval                      on serval
+       │                              │
+       ▼                              ▼
+  serval DuckDB row        notifications/claude/channel
+  (channel_history reads           │
+   here)                           ▼
+                      <channel …>body</channel> in
+                      john-dev's session, live
+```
 
 ## Token Efficiency
 
