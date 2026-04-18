@@ -188,28 +188,27 @@ server.registerTool(
       const senderGroup = sender.group_name || "default";
 
       let agents = await db.getAgents();
-      let targets = agents.filter(a => a && a.name && a.name !== name && a.pane_id);
+      let localTargets = agents.filter(a => a && a.name && a.name !== name && a.pane_id);
 
       const targetGroup = group === "all" ? null : (group || senderGroup);
       if (targetGroup) {
-        targets = targets.filter(a => a.group_name === targetGroup);
+        localTargets = localTargets.filter(a => a.group_name === targetGroup);
       }
 
-      if (targets.length === 0) {
-        const allAgents = await db.getAgents();
-        const groups = [...new Set(allAgents.filter(a => a && a.group_name).map(a => a.group_name))];
-        return targetGroup
-          ? `Error: No agents in group '${targetGroup}'. Available groups: ${groups.join(", ")}. Use agent_discover() or try group="all".`
-          : "Error: No other agents online. You're alone. Wait for others to join or check agent_discover().";
-      }
+      // Note: remote group members reached via NATS — their comms subprocesses
+      // filter by bound group and emit <channel kind="broadcast"> locally.
+      const effectiveGroup = targetGroup ?? "all";
+      await db.logMessage("BROADCAST", sender.id, null, effectiveGroup, message, natsTransport?.getHost() ?? null);
+      logToFile("BROADCAST", `${name} -> ${effectiveGroup}: ${message}`);
 
-      await db.logMessage("BROADCAST", sender.id, null, targetGroup, message);
-      logToFile("BROADCAST", `${name}: ${message}`);
+      if (natsTransport && targetGroup) {
+        natsTransport.publishBroadcast(targetGroup, name, message);
+      }
 
       const formattedMsg = `[${name}] ${message}`;
       const results: string[] = [];
 
-      for (const target of targets) {
+      for (const target of localTargets) {
         try {
           if (target.pane_id || target.stable_pane) {
             await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
@@ -220,8 +219,12 @@ server.registerTool(
         }
       }
 
+      const natsNote = natsTransport && targetGroup ? ` (+published to NATS for remote group members)` : "";
       const groupInfo = targetGroup ? ` in group '${targetGroup}'` : " (all groups)";
-      return `Broadcast sent to ${targets.length} agent(s)${groupInfo}:\n${results.join("\n")}`;
+      const tallyLine = localTargets.length > 0
+        ? `Local delivery to ${localTargets.length} agent(s)${groupInfo}:\n${results.join("\n")}`
+        : `No local agents in group '${targetGroup ?? "all"}'`;
+      return `${tallyLine}${natsNote}`;
     });
   }
 );
@@ -642,6 +645,19 @@ async function main() {
           logToFile("DM", `${msg.fromAgent}@${msg.originHost} -> ${msg.toAgent}: ${msg.content}`);
         } catch (err) {
           console.error("[nats] dm replicate failed:", err);
+        }
+      },
+      onBroadcast: async (msg) => {
+        try {
+          await db.insertReplicatedBroadcast({
+            group: msg.group,
+            fromAgent: msg.fromAgent,
+            content: msg.content,
+            originHost: msg.originHost,
+          });
+          logToFile("BROADCAST", `${msg.fromAgent}@${msg.originHost} -> ${msg.group}: ${msg.content}`);
+        } catch (err) {
+          console.error("[nats] broadcast replicate failed:", err);
         }
       },
     });

@@ -33,6 +33,14 @@ export interface RemoteDirectMessage {
   originTs: number;
 }
 
+export interface RemoteBroadcastMessage {
+  group: string;
+  fromAgent: string;
+  content: string;
+  originHost: string;
+  originTs: number;
+}
+
 export interface NatsTransportConfig {
   url: string;
   host?: string;
@@ -40,6 +48,7 @@ export interface NatsTransportConfig {
   peerTtlMs?: number;
   onChannelMessage?: (msg: RemoteChannelMessage) => void | Promise<void>;
   onDirectMessage?: (msg: RemoteDirectMessage) => void | Promise<void>;
+  onBroadcast?: (msg: RemoteBroadcastMessage) => void | Promise<void>;
   connector?: (url: string) => Promise<NatsConnection>;
   now?: () => number;
 }
@@ -55,6 +64,8 @@ const CHANNEL_SUBJECT_PREFIX = "agents.channel.";
 const CHANNEL_SUBJECT_WILDCARD = "agents.channel.*";
 const DM_SUBJECT_PREFIX = "agents.dm.";
 const DM_SUBJECT_WILDCARD = "agents.dm.*";
+const BROADCAST_SUBJECT_PREFIX = "agents.broadcast.";
+const BROADCAST_SUBJECT_WILDCARD = "agents.broadcast.*";
 const DEFAULT_HEARTBEAT_MS = 10_000;
 const DEFAULT_PEER_TTL_MS = 30_000;
 
@@ -70,6 +81,11 @@ function dmToSubject(toAgent: string): string {
   return DM_SUBJECT_PREFIX + Buffer.from(toAgent, "utf-8").toString("base64url");
 }
 
+// Group names share the same concerns — encode consistently.
+function broadcastToSubject(group: string): string {
+  return BROADCAST_SUBJECT_PREFIX + Buffer.from(group, "utf-8").toString("base64url");
+}
+
 export class NatsTransport {
   private readonly url: string;
   private readonly host: string;
@@ -79,16 +95,19 @@ export class NatsTransport {
   private readonly connector: (url: string) => Promise<NatsConnection>;
   private readonly onChannelMessage: (msg: RemoteChannelMessage) => void | Promise<void>;
   private readonly onDirectMessage: (msg: RemoteDirectMessage) => void | Promise<void>;
+  private readonly onBroadcast: (msg: RemoteBroadcastMessage) => void | Promise<void>;
   private readonly peers = new Map<string, PresenceBeat>();
   private readonly locals = new Map<string, LocalAgent>();
   private nc: NatsConnection | null = null;
   private presenceSub: Subscription | null = null;
   private channelSub: Subscription | null = null;
   private dmSub: Subscription | null = null;
+  private broadcastSub: Subscription | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private presenceLoop: Promise<void> | null = null;
   private channelLoop: Promise<void> | null = null;
   private dmLoop: Promise<void> | null = null;
+  private broadcastLoop: Promise<void> | null = null;
   private closed = false;
 
   constructor(config: NatsTransportConfig) {
@@ -99,6 +118,7 @@ export class NatsTransport {
     this.now = config.now ?? (() => Date.now());
     this.onChannelMessage = config.onChannelMessage ?? (() => {});
     this.onDirectMessage = config.onDirectMessage ?? (() => {});
+    this.onBroadcast = config.onBroadcast ?? (() => {});
     this.connector = config.connector ?? (async (url) => {
       const nats = await import("nats");
       return nats.connect({ servers: url, name: `agents-mcp@${this.host}` });
@@ -113,6 +133,8 @@ export class NatsTransport {
     this.channelLoop = this.consumeChannel(this.channelSub);
     this.dmSub = this.nc.subscribe(DM_SUBJECT_WILDCARD);
     this.dmLoop = this.consumeDm(this.dmSub);
+    this.broadcastSub = this.nc.subscribe(BROADCAST_SUBJECT_WILDCARD);
+    this.broadcastLoop = this.consumeBroadcast(this.broadcastSub);
     this.heartbeatTimer = setInterval(() => {
       this.publishAll().catch((err) => console.error("[nats] heartbeat failed:", err));
     }, this.heartbeatMs);
@@ -172,6 +194,18 @@ export class NatsTransport {
     this.nc.publish(dmToSubject(toAgent), Buffer.from(JSON.stringify(payload)));
   }
 
+  publishBroadcast(group: string, fromAgent: string, content: string): void {
+    if (!this.nc || this.closed) return;
+    const payload = {
+      group,
+      from_agent: fromAgent,
+      content,
+      origin_host: this.host,
+      origin_ts: this.now(),
+    };
+    this.nc.publish(broadcastToSubject(group), Buffer.from(JSON.stringify(payload)));
+  }
+
   getRemotePeers(group?: string): PresenceBeat[] {
     const cutoff = this.now() - this.peerTtlMs;
     const result: PresenceBeat[] = [];
@@ -197,18 +231,20 @@ export class NatsTransport {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
     }
-    for (const sub of [this.presenceSub, this.channelSub, this.dmSub]) {
+    for (const sub of [this.presenceSub, this.channelSub, this.dmSub, this.broadcastSub]) {
       if (sub) sub.unsubscribe();
     }
     this.presenceSub = null;
     this.channelSub = null;
     this.dmSub = null;
-    for (const loop of [this.presenceLoop, this.channelLoop, this.dmLoop]) {
+    this.broadcastSub = null;
+    for (const loop of [this.presenceLoop, this.channelLoop, this.dmLoop, this.broadcastLoop]) {
       if (loop) { try { await loop; } catch { /* drained */ } }
     }
     this.presenceLoop = null;
     this.channelLoop = null;
     this.dmLoop = null;
+    this.broadcastLoop = null;
     if (this.nc) {
       await this.nc.drain().catch(() => { /* best-effort */ });
       this.nc = null;
@@ -287,6 +323,34 @@ export class NatsTransport {
         });
       } catch (err) {
         console.error("[nats] bad dm payload:", err);
+      }
+    }
+  }
+
+  private async consumeBroadcast(sub: Subscription): Promise<void> {
+    for await (const msg of sub) {
+      try {
+        const raw = JSON.parse(Buffer.from(msg.data).toString("utf-8")) as {
+          group?: string;
+          from_agent?: string;
+          content?: string;
+          origin_host?: string;
+          origin_ts?: number;
+        };
+        if (!raw.group || !raw.from_agent || !raw.content || !raw.origin_host) {
+          console.error("[nats] bad broadcast payload: missing fields");
+          continue;
+        }
+        if (raw.origin_host === this.host) continue;
+        await this.onBroadcast({
+          group: raw.group,
+          fromAgent: raw.from_agent,
+          content: raw.content,
+          originHost: raw.origin_host,
+          originTs: raw.origin_ts ?? this.now(),
+        });
+      } catch (err) {
+        console.error("[nats] bad broadcast payload:", err);
       }
     }
   }

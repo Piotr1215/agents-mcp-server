@@ -184,6 +184,19 @@ export async function insertReplicatedDm(params: {
   return logMessage("DM", fromId, toId, null, params.content, params.originHost);
 }
 
+export async function insertReplicatedBroadcast(params: {
+  group: string;
+  fromAgent: string;
+  content: string;
+  originHost: string;
+}): Promise<number> {
+  // Store group name in the channel column so existing group_history queries
+  // (which filter by channel == group) pick remote broadcasts up unchanged.
+  const from = await getAgentByName(params.fromAgent);
+  const fromId = from?.id || params.fromAgent;
+  return logMessage("BROADCAST", fromId, null, params.group, params.content, params.originHost);
+}
+
 export async function getChannelHistory(channel: string, limit = 50): Promise<Message[]> {
   initSchema();
   const result = dbQuery(`SELECT * FROM messages WHERE channel = '${esc(channel)}' ORDER BY timestamp DESC LIMIT ${limit}`);

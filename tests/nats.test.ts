@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { NatsTransport, PresenceBeat, RemoteChannelMessage, RemoteDirectMessage } from "../src/nats.js";
+import { NatsTransport, PresenceBeat, RemoteChannelMessage, RemoteDirectMessage, RemoteBroadcastMessage } from "../src/nats.js";
 import type { NatsConnection, Subscription, Msg } from "nats";
 
 // NATS-style wildcard: "a.b.*" matches "a.b.X" but not "a.b" or "a.b.X.Y".
@@ -441,6 +441,119 @@ describe("NatsTransport", () => {
         connector: async () => fakeConnection(bus),
       });
       expect(() => t.publishDirectMessage("bob-ssh", "alice", "hi")).not.toThrow();
+    });
+  });
+
+  describe("broadcast pub/sub", () => {
+    it("publishes to agents.broadcast.<base64url(group)> with origin metadata", async () => {
+      const seen: Array<{ subject: string; payload: any }> = [];
+      bus.subscribe((subject, data) => {
+        if (subject.startsWith("agents.broadcast.")) {
+          seen.push({ subject, payload: JSON.parse(Buffer.from(data).toString("utf-8")) });
+        }
+      });
+      const t = new NatsTransport({
+        url: "fake",
+        host: "host-a",
+        connector: async () => fakeConnection(bus),
+        now: () => 88,
+      });
+      await t.start();
+      t.publishBroadcast("tasks", "triage-abc", "new task assigned");
+      expect(seen).toHaveLength(1);
+      const expectedSubject = "agents.broadcast." + Buffer.from("tasks", "utf-8").toString("base64url");
+      expect(seen[0].subject).toBe(expectedSubject);
+      expect(seen[0].payload).toMatchObject({
+        group: "tasks",
+        from_agent: "triage-abc",
+        content: "new task assigned",
+        origin_host: "host-a",
+        origin_ts: 88,
+      });
+      await t.close();
+    });
+
+    it("delivers remote broadcasts via onBroadcast callback", async () => {
+      const received: RemoteBroadcastMessage[] = [];
+      const recv = new NatsTransport({
+        url: "fake",
+        host: "host-b",
+        onBroadcast: (m) => { received.push(m); },
+        connector: async () => fakeConnection(bus),
+        now: () => 200,
+      });
+      await recv.start();
+
+      const sender = new NatsTransport({
+        url: "fake",
+        host: "host-a",
+        connector: async () => fakeConnection(bus),
+        now: () => 150,
+      });
+      await sender.start();
+      sender.publishBroadcast("tasks", "triage-abc", "ping the team");
+
+      await new Promise((r) => setTimeout(r, 10));
+      expect(received).toHaveLength(1);
+      expect(received[0]).toMatchObject({
+        group: "tasks",
+        fromAgent: "triage-abc",
+        content: "ping the team",
+        originHost: "host-a",
+        originTs: 150,
+      });
+      await sender.close();
+      await recv.close();
+    });
+
+    it("skips own-host echoes in broadcast receive loop", async () => {
+      const received: RemoteBroadcastMessage[] = [];
+      const t = new NatsTransport({
+        url: "fake",
+        host: "host-a",
+        onBroadcast: (m) => { received.push(m); },
+        connector: async () => fakeConnection(bus),
+        now: () => 1_000,
+      });
+      await t.start();
+      t.publishBroadcast("tasks", "triage-abc", "loopback");
+      await new Promise((r) => setTimeout(r, 10));
+      expect(received).toHaveLength(0);
+      await t.close();
+    });
+
+    it("drops broadcast payloads missing required fields", async () => {
+      const received: RemoteBroadcastMessage[] = [];
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const t = new NatsTransport({
+        url: "fake",
+        host: "host-b",
+        onBroadcast: (m) => { received.push(m); },
+        connector: async () => fakeConnection(bus),
+        now: () => 1_000,
+      });
+      await t.start();
+      const subject = "agents.broadcast." + Buffer.from("tasks", "utf-8").toString("base64url");
+      // Missing from_agent
+      bus.publish(subject, Buffer.from(JSON.stringify({
+        group: "tasks",
+        content: "no sender",
+        origin_host: "host-a",
+      })));
+      bus.publish(subject, Buffer.from("not-json"));
+      await new Promise((r) => setTimeout(r, 10));
+      expect(received).toHaveLength(0);
+      expect(errSpy).toHaveBeenCalled();
+      errSpy.mockRestore();
+      await t.close();
+    });
+
+    it("is a no-op when publishBroadcast is called before start()", () => {
+      const t = new NatsTransport({
+        url: "fake",
+        connector: async () => fakeConnection(bus),
+      });
+      expect(() => t.publishBroadcast("tasks", "triage", "hi")).not.toThrow();
     });
   });
 });
