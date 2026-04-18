@@ -4,7 +4,8 @@
   "description": "MCP server for NATS messaging system",
   "main": "build/index.js",
   "bin": {
-    "nats-mcp-server": "./build/index.js"
+    "nats-mcp-server": "./build/index.js",
+    "agents-channel-server": "./build/channel.js"
   },
   "type": "module",
   "scripts": {

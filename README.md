@@ -36,11 +36,45 @@ Add to `~/.claude/claude.json`:
   "mcpServers": {
     "agents": {
       "command": "node",
-      "args": ["/path/to/agents-mcp-server/build/index.js"]
+      "args": ["/path/to/agents-mcp-server/build/index.js"],
+      "env": {
+        "AGENTS_NATS_URL": "nats://nats.example:4222"
+      }
     }
   }
 }
 ```
+
+`AGENTS_NATS_URL` is optional. When unset the server runs in local-only mode (DuckDB + `snd`). When set, presence beats and `channel_send` messages are replicated across hosts that share the same NATS.
+
+## Real-time session push (Channels)
+
+Channels are async by default — `channel_send` writes to DuckDB and other agents catch up via `channel_history`. For live inbound pushed straight into an open Claude Code session, run the `agents-channel` server as a [Claude Code Channels source](https://code.claude.com/docs/en/channels.md).
+
+Add an entry to your `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "agents-channel": {
+      "command": "node",
+      "args": ["/path/to/agents-mcp-server/build/channel.js"],
+      "env": {
+        "AGENTS_NATS_URL": "nats://nats.example:4222",
+        "AGENTS_CHANNEL_FOR": "bob-ssh"
+      }
+    }
+  }
+}
+```
+
+Launch Claude Code with the channel enabled:
+
+```bash
+claude --dangerously-load-development-channels server:agents-channel
+```
+
+Inbound remote channel messages then arrive as `<channel source="agents-channel" channel="..." from_agent="..." origin_host="..." origin_ts="...">body</channel>` tags in the session. Own-host echoes are filtered.
 
 ## Tools
 
