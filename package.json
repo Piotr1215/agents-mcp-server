@@ -5,7 +5,8 @@
   "main": "build/index.js",
   "bin": {
     "nats-mcp-server": "./build/index.js",
-    "comms-server": "./build/comms.js"
+    "comms-server": "./build/comms.js",
+    "snd": "./build/snd.js"
   },
   "type": "module",
   "scripts": {

@@ -1,6 +1,6 @@
 # Agents MCP Server
 
-MCP server for agent-to-agent communication via DuckDB + snd (tmux message injection).
+MCP server for agent-to-agent communication over NATS with live session push via Claude Code Channels. State lives in local DuckDB; transport is single-bus (`AGENTS_NATS_URL`); delivery is uniform for local and cross-host targets.
 
 ## Design Principles
 
@@ -16,7 +16,7 @@ Built following [Block's MCP Playbook](https://engineering.block.xyz/blog/blocks
 
 - Node.js >= 18
 - DuckDB CLI
-- `snd` script in PATH (from `~/.claude/scripts/snd`)
+- A NATS server reachable via `AGENTS_NATS_URL`
 
 ## Installation
 
@@ -45,7 +45,20 @@ Add to `~/.claude/claude.json`:
 }
 ```
 
-`AGENTS_NATS_URL` is optional. When unset the server runs in local-only mode (DuckDB + `snd`). When set, presence beats and `channel_send` messages are replicated across hosts that share the same NATS.
+`AGENTS_NATS_URL` is **required**. The server is now single-bus: DMs, channels, broadcasts, and presence all go through NATS. Legacy tmux `snd` injection is gone. Sessions that want real-time inbound delivery must also launch the `comms` source (see below); without it, messages still persist to DuckDB (`dm_history`, `channel_history`, `group_history`) but do not push live.
+
+## `snd` CLI
+
+After `npm run build && npm link`, `snd` is on your `$PATH`:
+
+```
+snd <agent> <msg...>          DM to agent
+snd -t <agent> <msg...>       DM (explicit)
+snd -g <group> <msg...>       broadcast to group
+snd --human … <msg...>        prefix payload with [HUMAN] (wrapper does this for interactive use)
+```
+
+Only dependency is `AGENTS_NATS_URL`. One binary, one code path, callable from cron, shells, editor plugins.
 
 ## Real-time session push (comms)
 

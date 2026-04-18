@@ -56,10 +56,14 @@ function initSchema(): void {
       id VARCHAR PRIMARY KEY,
       name VARCHAR NOT NULL,
       group_name VARCHAR DEFAULT 'default',
-      pane_id VARCHAR,
-      stable_pane VARCHAR,
       registered_at TIMESTAMP DEFAULT now()
     );
+    -- Clean-break migration: drop legacy local-plane columns. pane_id /
+    -- stable_pane were tmux artifacts from the pre-NATS delivery era. The
+    -- server now lives strictly in the remote plane — comms handles push,
+    -- snd handles publish, neither cares about panes.
+    ALTER TABLE agents DROP COLUMN IF EXISTS pane_id;
+    ALTER TABLE agents DROP COLUMN IF EXISTS stable_pane;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_name ON agents(name);
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY,
@@ -96,8 +100,6 @@ export interface Agent {
   id: string;
   name: string;
   group_name: string;
-  pane_id: string | null;
-  stable_pane: string | null;
   registered_at: Date;
 }
 
@@ -111,9 +113,9 @@ export interface Message {
   content: string;
 }
 
-export async function registerAgent(id: string, name: string, group: string, paneId: string): Promise<void> {
+export async function registerAgent(id: string, name: string, group: string): Promise<void> {
   initSchema();
-  dbExec(`INSERT INTO agents (id, name, group_name, pane_id, registered_at) VALUES ('${esc(id)}', '${esc(name)}', '${esc(group)}', '${esc(paneId)}', now()) ON CONFLICT(name) DO UPDATE SET id = EXCLUDED.id, group_name = EXCLUDED.group_name, pane_id = EXCLUDED.pane_id, registered_at = EXCLUDED.registered_at`);
+  dbExec(`INSERT INTO agents (id, name, group_name, registered_at) VALUES ('${esc(id)}', '${esc(name)}', '${esc(group)}', now()) ON CONFLICT(name) DO UPDATE SET id = EXCLUDED.id, group_name = EXCLUDED.group_name, registered_at = EXCLUDED.registered_at`);
 }
 
 export async function deregisterAgent(id: string): Promise<Agent | null> {
@@ -148,6 +150,11 @@ export async function getAgentByName(name: string): Promise<Agent | null> {
   const result = dbQuery(`SELECT * FROM agents WHERE name = '${esc(name)}'`);
   const rows = JSON.parse(result || "[]");
   return rows[0] as Agent || null;
+}
+
+export async function setCommsBound(name: string, bound: boolean): Promise<void> {
+  initSchema();
+  dbExec(`UPDATE agents SET comms_bound = ${bound ? "true" : "false"} WHERE name = '${esc(name)}'`);
 }
 
 export async function logMessage(type: string, from: string | null, to: string | null, channel: string | null, content: string, originHost: string | null = null): Promise<number> {
