@@ -21,6 +21,12 @@ import {
   buildBroadcastNotification,
   CHANNEL_METHOD,
 } from "./notifications.js";
+import {
+  validateMessageBody,
+  validateDmTarget,
+  dmTargetIsReachable,
+  broadcastGroupIsReachable,
+} from "./validation.js";
 
 const LOG_FILE = "/tmp/agent_messages.log";
 
@@ -196,19 +202,33 @@ server.registerTool(
       if (!sender || !sender.id) {
         return `Error: You (${name}) not registered. Call agent_register first.`;
       }
-      const senderGroup = sender.group_name || "default";
-      const targetGroup = group === "all" ? null : (group || senderGroup);
 
-      const effectiveGroup = targetGroup ?? "all";
-      await db.logMessage("BROADCAST", sender.id, null, effectiveGroup, message, natsTransport?.getHost() ?? null);
-      logToFile("BROADCAST", `${name} -> ${effectiveGroup}: ${message}`);
+      const bodyErr = validateMessageBody(message);
+      if (bodyErr) return `Error: broadcast ${bodyErr}.`;
 
       if (!natsTransport) {
         return `Error: NATS transport not configured — broadcasts require AGENTS_NATS_URL.`;
       }
+
+      const senderGroup = sender.group_name || "default";
+      const targetGroup = group === "all" ? null : (group || senderGroup);
       if (!targetGroup) {
         return `Error: broadcast requires a target group (or group="all" is not yet wired for wildcard publish).`;
       }
+
+      // Reject broadcasts to groups with zero registered agents (local + remote).
+      // Catches typos like `-g nonexistent-group`; does not reject when the
+      // sender is the only member in their own group (valid "group of one").
+      const groupReachable = await broadcastGroupIsReachable(targetGroup, {
+        localMemberCount: async (g) => (await db.getAgents(g)).length,
+        remoteMemberCount: (g) => natsTransport!.getRemotePeers(g).length,
+      });
+      if (!groupReachable) {
+        return `Error: group '${targetGroup}' has no registered agents. Use agent_groups to see active groups.`;
+      }
+
+      await db.logMessage("BROADCAST", sender.id, null, targetGroup, message, natsTransport.getHost());
+      logToFile("BROADCAST", `${name} -> ${targetGroup}: ${message}`);
 
       natsTransport.publishBroadcast(targetGroup, name, message);
       return `Broadcast published to group '${targetGroup}' over NATS. Sessions bound to that group receive it as <channel kind="broadcast">.`;
@@ -239,7 +259,25 @@ server.registerTool(
         return `Error: NATS transport not configured — DMs require AGENTS_NATS_URL.`;
       }
 
+      const bodyErr = validateMessageBody(message);
+      if (bodyErr) return `Error: DM ${bodyErr}.`;
+
+      const selfErr = validateDmTarget(name, to);
+      if (selfErr) return `Error: ${selfErr}.`;
+
+      // Ghost-target rejection: look up target locally, then in the NATS
+      // presence cache (30s TTL). A just-deregistered target can still slip
+      // through — acceptable, matches the system's existing eventual-consistency
+      // model. Purpose is catching typos and stale names, not strict correctness.
       const target = await db.getAgentByName(to);
+      const reachable = await dmTargetIsReachable(to, {
+        hasLocalAgent: () => !!target,
+        hasRemotePeer: (n) => natsTransport!.getRemotePeers().some((p) => p.name === n),
+      });
+      if (!reachable) {
+        return `Error: agent '${to}' not registered. Use agent_discover to see active agents.`;
+      }
+
       const targetId = target?.id || to;
       await db.logMessage("DM", sender.id, targetId, null, message, natsTransport.getHost());
       logToFile("DM", `${name} -> ${to}: ${message}`);
