@@ -5,14 +5,12 @@
 // Agent communication via DuckDB + snd
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { spawn } from "child_process";
 import { randomBytes } from "crypto";
 import { z } from "zod";
 import { appendFileSync } from "fs";
 import * as db from "./db.js";
 import { initNatsTransport, NatsTransport } from "./nats.js";
 
-const SND_PATH = process.env.SND_PATH || "/home/decoder/.claude/scripts/snd";
 const LOG_FILE = "/tmp/agent_messages.log";
 
 let natsTransport: NatsTransport | null = null;
@@ -20,21 +18,6 @@ let natsTransport: NatsTransport | null = null;
 function logToFile(type: string, content: string): void {
   const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
   appendFileSync(LOG_FILE, `[${ts}] [${type}] ${content}\n`);
-}
-
-async function runSnd(pane: string, message: string, stablePane?: string | null): Promise<void> {
-  const target = pane || stablePane || "";
-  if (!target) return;
-  return new Promise((resolve, reject) => {
-    const proc = spawn(SND_PATH, ["--pane", target, message], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    proc.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`snd failed with code ${code}`));
-    });
-    proc.on("error", reject);
-  });
 }
 
 function generateAgentId(name: string): string {
@@ -96,9 +79,7 @@ server.registerTool(
       const existing = await db.getAgentByName(name);
       const agentId = existing?.id || generateAgentId(name);
 
-      // Write to DB immediately so agent is findable even if hook fails
-      // Hook will update with pane info later
-      await db.registerAgent(agentId, name, groupName, existing?.pane_id || "");
+      await db.registerAgent(agentId, name, groupName);
 
       const allAgents = await db.getAgents(groupName);
       const peers: Array<{ name: string; group: string; host?: string }> = allAgents
@@ -145,13 +126,10 @@ server.registerTool(
           message: "was already gone or never registered"
         });
       }
-      // Capture info BEFORE deletion for hook to use
       const agentInfo = {
         id: agent.id,
         name: agent.name,
         group_name: agent.group_name || "default",
-        pane_id: agent.pane_id,
-        stable_pane: agent.stable_pane
       };
       await db.deregisterAgent(agent.id);
       await db.logMessage("LEFT", agent.id, null, agent.group_name || "default", `${agent.name} left`);
@@ -183,48 +161,24 @@ server.registerTool(
     return withMetrics("agent_broadcast", async () => {
       const sender = await db.getAgentByName(name);
       if (!sender || !sender.id) {
-        return `Error: You (${name}) not registered or registration incomplete. Call agent_register(name, description) first, then wait a moment for hook to complete.`;
+        return `Error: You (${name}) not registered. Call agent_register first.`;
       }
       const senderGroup = sender.group_name || "default";
-
-      let agents = await db.getAgents();
-      let localTargets = agents.filter(a => a && a.name && a.name !== name && a.pane_id);
-
       const targetGroup = group === "all" ? null : (group || senderGroup);
-      if (targetGroup) {
-        localTargets = localTargets.filter(a => a.group_name === targetGroup);
-      }
 
-      // Note: remote group members reached via NATS — their comms subprocesses
-      // filter by bound group and emit <channel kind="broadcast"> locally.
       const effectiveGroup = targetGroup ?? "all";
       await db.logMessage("BROADCAST", sender.id, null, effectiveGroup, message, natsTransport?.getHost() ?? null);
       logToFile("BROADCAST", `${name} -> ${effectiveGroup}: ${message}`);
 
-      if (natsTransport && targetGroup) {
-        natsTransport.publishBroadcast(targetGroup, name, message);
+      if (!natsTransport) {
+        return `Error: NATS transport not configured — broadcasts require AGENTS_NATS_URL.`;
+      }
+      if (!targetGroup) {
+        return `Error: broadcast requires a target group (or group="all" is not yet wired for wildcard publish).`;
       }
 
-      const formattedMsg = `[${name}] ${message}`;
-      const results: string[] = [];
-
-      for (const target of localTargets) {
-        try {
-          if (target.pane_id || target.stable_pane) {
-            await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
-            results.push(`✓ ${target.name}`);
-          }
-        } catch (err) {
-          results.push(`✗ ${target.name}: ${err}`);
-        }
-      }
-
-      const natsNote = natsTransport && targetGroup ? ` (+published to NATS for remote group members)` : "";
-      const groupInfo = targetGroup ? ` in group '${targetGroup}'` : " (all groups)";
-      const tallyLine = localTargets.length > 0
-        ? `Local delivery to ${localTargets.length} agent(s)${groupInfo}:\n${results.join("\n")}`
-        : `No local agents in group '${targetGroup ?? "all"}'`;
-      return `${tallyLine}${natsNote}`;
+      natsTransport.publishBroadcast(targetGroup, name, message);
+      return `Broadcast published to group '${targetGroup}' over NATS. Sessions bound to that group receive it as <channel kind="broadcast">.`;
     });
   }
 );
@@ -246,41 +200,19 @@ server.registerTool(
     return withMetrics("agent_dm", async () => {
       const sender = await db.getAgentByName(name);
       if (!sender || !sender.id) {
-        return `Error: You (${name}) not registered or registration incomplete. Call agent_register(name, description) first.`;
+        return `Error: You (${name}) not registered. Call agent_register first.`;
+      }
+      if (!natsTransport) {
+        return `Error: NATS transport not configured — DMs require AGENTS_NATS_URL.`;
       }
 
       const target = await db.getAgentByName(to);
-      const localReachable = !!(target && target.id && (target.pane_id || target.stable_pane));
-      const remotePeer = natsTransport?.getRemotePeers().find(p => p.name === to);
-
-      if (!localReachable && !remotePeer) {
-        const agents = await db.getAgents();
-        const localNames = agents.filter(a => a && a.name).map(a => a.name);
-        const remoteNames = natsTransport?.getRemotePeers().map(p => p.name) ?? [];
-        const allNames = [...localNames, ...remoteNames].join(", ");
-        return `Error: Agent '${to}' not reachable. Active agents: ${allNames || "none"}. Use agent_discover() to refresh.`;
-      }
-
       const targetId = target?.id || to;
-      await db.logMessage("DM", sender.id, targetId, null, message, natsTransport?.getHost() ?? null);
+      await db.logMessage("DM", sender.id, targetId, null, message, natsTransport.getHost());
       logToFile("DM", `${name} -> ${to}: ${message}`);
 
-      if (localReachable && target) {
-        const formattedMsg = `[DM from ${name}] ${message}`;
-        try {
-          await runSnd(target.pane_id || "", formattedMsg, target.stable_pane);
-          return `DM sent to ${target.name}`;
-        } catch (err) {
-          return `Failed to send DM locally: ${err}`;
-        }
-      }
-
-      if (natsTransport) {
-        natsTransport.publishDirectMessage(to, name, message);
-        return `DM sent to ${to} via NATS (remote host: ${remotePeer?.host ?? "unknown"})`;
-      }
-
-      return `Error: Agent '${to}' only reachable remotely and NATS transport is not configured.`;
+      natsTransport.publishDirectMessage(to, name, message);
+      return `DM published to '${to}' over NATS. Live delivery happens if the recipient session has comms_bind active.`;
     });
   }
 );
@@ -309,7 +241,7 @@ server.registerTool(
 
       const localHost = natsTransport ? natsTransport.getHost() : "local";
       const localLines = validAgents.map(a =>
-        `- ${a.name} (${a.id}): active | group: ${a.group_name || "default"} | host: ${localHost} | pane: ${a.pane_id || "unknown"}`
+        `- ${a.name} (${a.id}): active | group: ${a.group_name || "default"} | host: ${localHost} | local`
       );
       const remoteLines = remotePeers.map(p =>
         `- ${p.name} (${p.agent_id}): active | group: ${p.group} | host: ${p.host} | remote`
