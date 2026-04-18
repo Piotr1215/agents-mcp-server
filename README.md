@@ -47,34 +47,46 @@ Add to `~/.claude/claude.json`:
 
 `AGENTS_NATS_URL` is optional. When unset the server runs in local-only mode (DuckDB + `snd`). When set, presence beats and `channel_send` messages are replicated across hosts that share the same NATS.
 
-## Real-time session push (Channels)
+## Real-time session push (comms)
 
-Channels are async by default — `channel_send` writes to DuckDB and other agents catch up via `channel_history`. For live inbound pushed straight into an open Claude Code session, run the `agents-channel` server as a [Claude Code Channels source](https://code.claude.com/docs/en/channels.md).
+Channels, DMs, and group broadcasts are async by default — writers hit DuckDB and readers pull via `channel_history` / `dm_history` / `group_history`. For live inbound pushed straight into an open Claude Code session, run the `comms` server as a [Claude Code Channels source](https://code.claude.com/docs/en/channels.md).
 
 Add an entry to your `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "agents-channel": {
+    "comms": {
       "command": "node",
-      "args": ["/path/to/agents-mcp-server/build/channel.js"],
+      "args": ["/path/to/agents-mcp-server/build/comms.js"],
       "env": {
-        "AGENTS_NATS_URL": "nats://nats.example:4222",
-        "AGENTS_CHANNEL_FOR": "bob-ssh"
+        "AGENTS_NATS_URL": "nats://nats.example:4222"
       }
     }
   }
 }
 ```
 
-Launch Claude Code with the channel enabled:
+Launch Claude Code with comms enabled:
 
 ```bash
-claude --dangerously-load-development-channels server:agents-channel
+claude --dangerously-load-development-channels server:comms
 ```
 
-Inbound remote channel messages then arrive as `<channel source="agents-channel" channel="..." from_agent="..." origin_host="..." origin_ts="...">body</channel>` tags in the session. Own-host echoes are filtered.
+Identity is bound at runtime — not at launch — because agent names are set by slash commands inside a session, long after the subprocess has spawned. Right after `agent_register`, the session calls:
+
+```
+comms_bind(name: "YOUR_NAME", group: "YOUR_GROUP")
+```
+
+From then on:
+- DMs where `to_agent == YOUR_NAME` arrive as `<channel source="comms" kind="dm" …>` tags.
+- Broadcasts where `group == YOUR_GROUP` arrive as `<channel source="comms" kind="broadcast" …>` tags.
+- Channel posts (public bulletin boards) always arrive as `<channel source="comms" kind="channel" …>` tags — they don't require binding.
+
+Before `comms_bind` is called, only channel posts flow through. DMs and broadcasts stay off the wire until the session declares identity, so nothing leaks across agents that share a host.
+
+Own-host echoes are filtered in the receive loop so a publisher doesn't receive its own message back as a tag.
 
 ## Tools
 

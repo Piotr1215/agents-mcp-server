@@ -1,6 +1,17 @@
 import { describe, it, expect } from "vitest";
-import { buildChannelNotification, buildDmNotification } from "../src/channel.js";
-import type { RemoteChannelMessage, RemoteDirectMessage } from "../src/nats.js";
+import {
+  buildChannelNotification,
+  buildDmNotification,
+  buildBroadcastNotification,
+  shouldDeliverDm,
+  shouldDeliverBroadcast,
+  CommsBinding,
+} from "../src/comms.js";
+import type {
+  RemoteChannelMessage,
+  RemoteDirectMessage,
+  RemoteBroadcastMessage,
+} from "../src/nats.js";
 
 const sample = (overrides: Partial<RemoteChannelMessage> = {}): RemoteChannelMessage => ({
   channel: "#eng",
@@ -96,5 +107,67 @@ describe("buildDmNotification", () => {
     const msg = { ...dmSample(), originTs: undefined as unknown as number };
     const out = buildDmNotification(msg);
     expect(out.meta).not.toHaveProperty("origin_ts");
+  });
+});
+
+const bcastSample = (overrides: Partial<RemoteBroadcastMessage> = {}): RemoteBroadcastMessage => ({
+  group: "tasks",
+  fromAgent: "triage",
+  content: "new task",
+  originHost: "host-a",
+  originTs: 1_700_000_000_000,
+  ...overrides,
+});
+
+describe("buildBroadcastNotification", () => {
+  it("maps RemoteBroadcastMessage fields into content + meta with kind=broadcast", () => {
+    const out = buildBroadcastNotification(bcastSample());
+    expect(out.content).toBe("new task");
+    expect(out.meta).toEqual({
+      kind: "broadcast",
+      from_agent: "triage",
+      group: "tasks",
+      origin_host: "host-a",
+      origin_ts: "1700000000000",
+    });
+  });
+
+  it("emits exactly the expected meta keys", () => {
+    const out = buildBroadcastNotification(bcastSample());
+    expect(Object.keys(out.meta).sort()).toEqual(
+      ["from_agent", "group", "kind", "origin_host", "origin_ts"].sort()
+    );
+  });
+});
+
+describe("comms binding filters", () => {
+  it("shouldDeliverDm drops when unbound", () => {
+    const binding: CommsBinding = { name: null, group: null };
+    expect(shouldDeliverDm(binding, dmSample())).toBe(false);
+  });
+
+  it("shouldDeliverDm passes when toAgent matches bound name", () => {
+    const binding: CommsBinding = { name: "bob-ssh", group: null };
+    expect(shouldDeliverDm(binding, dmSample({ toAgent: "bob-ssh" }))).toBe(true);
+  });
+
+  it("shouldDeliverDm drops when toAgent is someone else", () => {
+    const binding: CommsBinding = { name: "bob-ssh", group: null };
+    expect(shouldDeliverDm(binding, dmSample({ toAgent: "alice-abc" }))).toBe(false);
+  });
+
+  it("shouldDeliverBroadcast drops when group is unbound even if name is set", () => {
+    const binding: CommsBinding = { name: "bob-ssh", group: null };
+    expect(shouldDeliverBroadcast(binding, bcastSample())).toBe(false);
+  });
+
+  it("shouldDeliverBroadcast passes when group matches bound group", () => {
+    const binding: CommsBinding = { name: "bob-ssh", group: "tasks" };
+    expect(shouldDeliverBroadcast(binding, bcastSample({ group: "tasks" }))).toBe(true);
+  });
+
+  it("shouldDeliverBroadcast drops when group differs", () => {
+    const binding: CommsBinding = { name: "bob-ssh", group: "tasks" };
+    expect(shouldDeliverBroadcast(binding, bcastSample({ group: "research" }))).toBe(false);
   });
 });
