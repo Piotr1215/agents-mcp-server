@@ -104,7 +104,9 @@ export class NatsTransport {
   // Monotonic per-process sequence. Breaks ties when two publishes land in
   // the same millisecond — consumers can sort by (origin_ts, origin_seq) for
   // deterministic ordering within a single publisher. Cross-host ordering is
-  // out of scope: each host maintains its own counter.
+  // out of scope: each host maintains its own counter. Resets to 0 on process
+  // restart; durability across restarts would need a persisted counter or a
+  // global broker sequence, neither of which is required for tie-breaking.
   private seq: number = 0;
   private nc: NatsConnection | null = null;
   private presenceSub: Subscription | null = null;
