@@ -118,6 +118,7 @@ export class NatsTransport {
   private channelLoop: Promise<void> | null = null;
   private dmLoop: Promise<void> | null = null;
   private broadcastLoop: Promise<void> | null = null;
+  private statusLoop: Promise<void> | null = null;
   private closed = false;
 
   constructor(config: NatsTransportConfig) {
@@ -131,20 +132,23 @@ export class NatsTransport {
     this.onBroadcast = config.onBroadcast ?? (() => {});
     this.connector = config.connector ?? (async (url) => {
       const nats = await import("nats");
-      return nats.connect({ servers: url, name: `agents-mcp@${this.host}` });
+      // Infinite reconnect: broker flaps longer than the default 20s budget
+      // (10 attempts × 2000ms) would permanently silence this session until
+      // process restart. See Piotr1215/claude#120.
+      return nats.connect({
+        servers: url,
+        name: `agents-mcp@${this.host}`,
+        maxReconnectAttempts: -1,
+        reconnectTimeWait: 2000,
+        pingInterval: 20_000,
+      });
     });
   }
 
   async start(): Promise<void> {
     this.nc = await this.connector(this.url);
-    this.presenceSub = this.nc.subscribe(PRESENCE_SUBJECT);
-    this.presenceLoop = this.consumePresence(this.presenceSub);
-    this.channelSub = this.nc.subscribe(CHANNEL_SUBJECT_WILDCARD);
-    this.channelLoop = this.consumeChannel(this.channelSub);
-    this.dmSub = this.nc.subscribe(DM_SUBJECT_WILDCARD);
-    this.dmLoop = this.consumeDm(this.dmSub);
-    this.broadcastSub = this.nc.subscribe(BROADCAST_SUBJECT_WILDCARD);
-    this.broadcastLoop = this.consumeBroadcast(this.broadcastSub);
+    this.setupSubscriptions();
+    this.statusLoop = this.consumeStatus(this.nc);
     this.heartbeatTimer = setInterval(() => {
       this.publishAll().catch((err) => console.error("[nats] heartbeat failed:", err));
     }, this.heartbeatMs);
@@ -255,13 +259,14 @@ export class NatsTransport {
     this.channelSub = null;
     this.dmSub = null;
     this.broadcastSub = null;
-    for (const loop of [this.presenceLoop, this.channelLoop, this.dmLoop, this.broadcastLoop]) {
+    for (const loop of [this.presenceLoop, this.channelLoop, this.dmLoop, this.broadcastLoop, this.statusLoop]) {
       if (loop) { try { await loop; } catch { /* drained */ } }
     }
     this.presenceLoop = null;
     this.channelLoop = null;
     this.dmLoop = null;
     this.broadcastLoop = null;
+    this.statusLoop = null;
     if (this.nc) {
       await this.nc.drain().catch(() => { /* best-effort */ });
       this.nc = null;
@@ -271,6 +276,52 @@ export class NatsTransport {
   // Visible for tests.
   ingestBeat(beat: PresenceBeat): void {
     this.peers.set(beat.agent_id, beat);
+  }
+
+  // (Re)create all four wildcard subscriptions and the consume loops feeding
+  // them. Called once from start() and again from the status watcher on every
+  // reconnect — nats.js v2 keeps pre-existing Subscription objects alive after
+  // reconnect, but we've seen iterator stalls in practice (#120), so re-
+  // establishing the subs is belt-and-braces. Visible for tests.
+  setupSubscriptions(): void {
+    if (!this.nc) return;
+    for (const sub of [this.presenceSub, this.channelSub, this.dmSub, this.broadcastSub]) {
+      if (sub) sub.unsubscribe();
+    }
+    this.presenceSub = this.nc.subscribe(PRESENCE_SUBJECT);
+    this.presenceLoop = this.consumePresence(this.presenceSub);
+    this.channelSub = this.nc.subscribe(CHANNEL_SUBJECT_WILDCARD);
+    this.channelLoop = this.consumeChannel(this.channelSub);
+    this.dmSub = this.nc.subscribe(DM_SUBJECT_WILDCARD);
+    this.dmLoop = this.consumeDm(this.dmSub);
+    this.broadcastSub = this.nc.subscribe(BROADCAST_SUBJECT_WILDCARD);
+    this.broadcastLoop = this.consumeBroadcast(this.broadcastSub);
+  }
+
+  // Watch the connection's status event stream. Log lifecycle transitions for
+  // debuggability, and resubscribe on reconnect so a silenced flap cannot wipe
+  // inbound delivery for the rest of the process lifetime (#120).
+  private async consumeStatus(nc: NatsConnection): Promise<void> {
+    // Fake connections in tests may not implement status(); skip silently.
+    if (typeof nc.status !== "function") return;
+    let stream: AsyncIterable<{ type: string; data?: unknown }>;
+    try {
+      stream = nc.status() as AsyncIterable<{ type: string; data?: unknown }>;
+      if (!stream || typeof (stream as AsyncIterable<unknown>)[Symbol.asyncIterator] !== "function") return;
+    } catch {
+      return;
+    }
+    try {
+      for await (const status of stream) {
+        if (this.closed) break;
+        console.error(`[nats] ${status.type}${status.data ? `: ${status.data}` : ""}`);
+        if (status.type === "reconnect") {
+          this.setupSubscriptions();
+        }
+      }
+    } catch (err) {
+      if (!this.closed) console.error("[nats] status loop exited:", err);
+    }
   }
 
   private async consumePresence(sub: Subscription): Promise<void> {
