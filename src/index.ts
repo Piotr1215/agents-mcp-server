@@ -1,8 +1,13 @@
 #!/usr/bin/env node
 // PROJECT: claude-automation, agent-lifecycle
-// See: ops-autonomous-worker.md, ops-triage-agent.md, __mcp_agent_registration_hook.sh
 // Issue: https://github.com/Piotr1215/claude/issues/42
-// Agent communication via DuckDB + snd
+// Agent communication over NATS. Single MCP process exposes tools AND acts as
+// a Claude Code Channels source — agent_register binds the session's identity
+// implicitly, so DMs and group broadcasts push in as <channel> tags with no
+// second call. When the session is launched with
+// `claude --dangerously-load-development-channels server:agents`, Claude Code
+// treats this same subprocess as the channel source and routes its
+// notifications/claude/channel events into the live transcript.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { randomBytes } from "crypto";
@@ -10,10 +15,22 @@ import { z } from "zod";
 import { appendFileSync } from "fs";
 import * as db from "./db.js";
 import { initNatsTransport, NatsTransport } from "./nats.js";
+import {
+  buildChannelNotification,
+  buildDmNotification,
+  buildBroadcastNotification,
+  CHANNEL_METHOD,
+} from "./notifications.js";
 
 const LOG_FILE = "/tmp/agent_messages.log";
 
 let natsTransport: NatsTransport | null = null;
+
+// In-process identity binding set by agent_register, consumed by the
+// channel-notification emitters. When unset, DMs and broadcasts still flow
+// to DuckDB (so *_history works) but are not pushed into the session — the
+// session is send-only until someone calls agent_register.
+let sessionBinding: { name: string; group: string; agentId: string } | null = null;
 
 function logToFile(type: string, content: string): void {
   const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
@@ -52,11 +69,18 @@ async function withMetrics<T>(
   }
 }
 
-// Create server
+// Create server. Declares the Claude Code Channels capability alongside
+// tools: when the session is launched with
+// `claude --dangerously-load-development-channels server:agents`, this same
+// subprocess is the channel source. No separate comms server needed.
 const server = new McpServer(
-  { name: "agents-mcp-server", version: "3.0.0" },
+  { name: "agents", version: "4.0.0" },
   {
-    instructions: "Multi-agent coordination server. Call agent_register(name, description) first to join. Use agent_discover() to find peers. Use agent_broadcast() for group messages, agent_dm() for direct messages. Channels are group-scoped via channel_send(). Check dm_history() or channel_history() to catch up on conversations."
+    capabilities: {
+      tools: {},
+      experimental: { "claude/channel": {} },
+    },
+    instructions: "Multi-agent coordination server with live session push. agent_register(name, description, group) both joins and binds this session — from that moment on, DMs to this name and broadcasts to this group push in as <channel source=\"agents\" kind=\"dm|broadcast|channel\">body</channel> tags. Use agent_broadcast, agent_dm, channel_send for outbound. Use *_history tools for catch-up reads. Deregister on shutdown.",
   }
 );
 
@@ -85,6 +109,12 @@ server.registerTool(
       const peers: Array<{ name: string; group: string; host?: string }> = allAgents
         .filter(a => a && a.name && a.name !== name)
         .map(a => ({ name: a.name, group: a.group_name }));
+
+      // Implicitly bind this session's identity. No separate comms_bind tool:
+      // one agent per session, set at register time. From now on, DMs to this
+      // name and broadcasts to this group will push into the session as
+      // <channel> tags.
+      sessionBinding = { name, group: groupName, agentId };
 
       if (natsTransport) {
         const localAgent = { agent_id: agentId, name, group: groupName };
@@ -134,6 +164,9 @@ server.registerTool(
       await db.deregisterAgent(agent.id);
       await db.logMessage("LEFT", agent.id, null, agent.group_name || "default", `${agent.name} left`);
       if (natsTransport) natsTransport.untrackLocal(agent.id);
+      if (sessionBinding && sessionBinding.agentId === agent.id) {
+        sessionBinding = null;
+      }
       return JSON.stringify({
         success: true,
         ...agentInfo,
@@ -562,8 +595,13 @@ async function main() {
             originHost: msg.originHost,
           });
           logToFile("CHANNEL", `#${msg.channel} ${msg.fromAgent}@${msg.originHost}: ${msg.content}`);
+          // Channel posts are public — push to every bound session.
+          if (sessionBinding && natsTransport) {
+            const params = buildChannelNotification(msg, natsTransport.getHost());
+            await server.server.notification({ method: CHANNEL_METHOD, params });
+          }
         } catch (err) {
-          console.error("[nats] channel replicate failed:", err);
+          console.error("[nats] channel handler failed:", err);
         }
       },
       onDirectMessage: async (msg) => {
@@ -575,8 +613,13 @@ async function main() {
             originHost: msg.originHost,
           });
           logToFile("DM", `${msg.fromAgent}@${msg.originHost} -> ${msg.toAgent}: ${msg.content}`);
+          // Private: push only when addressed to the session's bound identity.
+          if (sessionBinding && natsTransport && msg.toAgent === sessionBinding.name) {
+            const params = buildDmNotification(msg, natsTransport.getHost());
+            await server.server.notification({ method: CHANNEL_METHOD, params });
+          }
         } catch (err) {
-          console.error("[nats] dm replicate failed:", err);
+          console.error("[nats] dm handler failed:", err);
         }
       },
       onBroadcast: async (msg) => {
@@ -588,8 +631,13 @@ async function main() {
             originHost: msg.originHost,
           });
           logToFile("BROADCAST", `${msg.fromAgent}@${msg.originHost} -> ${msg.group}: ${msg.content}`);
+          // Push if the bound group matches the broadcast target.
+          if (sessionBinding && natsTransport && msg.group === sessionBinding.group) {
+            const params = buildBroadcastNotification(msg, natsTransport.getHost());
+            await server.server.notification({ method: CHANNEL_METHOD, params });
+          }
         } catch (err) {
-          console.error("[nats] broadcast replicate failed:", err);
+          console.error("[nats] broadcast handler failed:", err);
         }
       },
     });
@@ -597,7 +645,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   const natsStatus = natsTransport ? ` + NATS@${natsTransport.getHost()}` : "";
-  console.error(`Agents MCP Server v3.1.0 (McpServer + DuckDB${natsStatus}) running`);
+  console.error(`agents MCP v4.0.0 (tools + channel source${natsStatus}) running`);
 }
 
 main().catch(console.error);
