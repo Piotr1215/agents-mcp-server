@@ -6,12 +6,25 @@ const DB_PATH = process.env.AGENTS_DB_PATH || "/home/decoder/.claude/data/agents
 
 let initialized = false;
 
+// Thrown by dbExec / dbQuery when retries are exhausted. Callers on critical
+// paths (register, history reads) let it propagate so the failure is loud.
+// Non-critical paths (logMessage, metrics) wrap in try/catch. Prior behavior
+// was to log + return silently, which masked Piotr1215/claude#120-class bugs
+// for hours — the register UPSERT appeared to succeed when it hadn't.
+export class DbError extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = "DbError";
+  }
+}
+
 // Escape string for SQL single-quoted literals
 function esc(value: string): string {
   return value.replace(/'/g, "''").replace(/\\/g, "\\\\");
 }
 
 function dbQuery(sql: string, retries = 5): string {
+  let lastErr: unknown;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       return execSync(`duckdb "${DB_PATH}" -json -c "${sql.replace(/"/g, '\\"')}"`, {
@@ -19,18 +32,18 @@ function dbQuery(sql: string, retries = 5): string {
         timeout: 5000,
       }).trim();
     } catch (e) {
-      if (attempt === retries - 1) {
-        console.error("[db] Query failed after retries:", e);
-        return "[]";
-      }
+      lastErr = e;
+      if (attempt === retries - 1) break;
       const delay = Math.pow(2, attempt) * 100;
       execSync(`sleep ${delay / 1000}`);
     }
   }
-  return "[]";
+  console.error("[db] Query failed after retries:", lastErr);
+  throw new DbError(`dbQuery failed after ${retries} retries`, lastErr);
 }
 
 function dbExec(sql: string, retries = 5): void {
+  let lastErr: unknown;
   for (let attempt = 0; attempt < retries; attempt++) {
     try {
       execSync(`duckdb "${DB_PATH}" -c "${sql.replace(/"/g, '\\"')}"`, {
@@ -39,14 +52,14 @@ function dbExec(sql: string, retries = 5): void {
       });
       return;
     } catch (e) {
-      if (attempt === retries - 1) {
-        console.error("[db] Exec failed after retries:", e);
-        return;
-      }
+      lastErr = e;
+      if (attempt === retries - 1) break;
       const delay = Math.pow(2, attempt) * 100;
       execSync(`sleep ${delay / 1000}`);
     }
   }
+  console.error("[db] Exec failed after retries:", lastErr);
+  throw new DbError(`dbExec failed after ${retries} retries`, lastErr);
 }
 
 function initSchema(): void {
@@ -164,11 +177,20 @@ export async function setCommsBound(name: string, bound: boolean): Promise<void>
 
 export async function logMessage(type: string, from: string | null, to: string | null, channel: string | null, content: string, originHost: string | null = null): Promise<number> {
   initSchema();
-  const idResult = dbQuery(`SELECT nextval('msg_seq') as id`);
-  const rows = JSON.parse(idResult || "[]");
-  const id = rows[0]?.id ?? Date.now();
-  dbExec(`INSERT INTO messages (id, type, from_agent, to_agent, channel, content, origin_host) VALUES (${id}, '${esc(type)}', ${from ? `'${esc(from)}'` : 'NULL'}, ${to ? `'${esc(to)}'` : 'NULL'}, ${channel ? `'${esc(channel)}'` : 'NULL'}, '${esc(content)}', ${originHost ? `'${esc(originHost)}'` : 'NULL'})`);
-  return id;
+  // Best-effort: the canonical delivery path is NATS. If logging fails we
+  // still want the DM/broadcast to have been delivered, not to throw up the
+  // stack and mislead the caller into thinking the send itself failed. The
+  // DbError still hits stderr via dbExec/dbQuery so the outage is visible.
+  try {
+    const idResult = dbQuery(`SELECT nextval('msg_seq') as id`);
+    const rows = JSON.parse(idResult || "[]");
+    const id = rows[0]?.id ?? Date.now();
+    dbExec(`INSERT INTO messages (id, type, from_agent, to_agent, channel, content, origin_host) VALUES (${id}, '${esc(type)}', ${from ? `'${esc(from)}'` : 'NULL'}, ${to ? `'${esc(to)}'` : 'NULL'}, ${channel ? `'${esc(channel)}'` : 'NULL'}, '${esc(content)}', ${originHost ? `'${esc(originHost)}'` : 'NULL'})`);
+    return id;
+  } catch (e) {
+    if (e instanceof DbError) return -1;
+    throw e;
+  }
 }
 
 export async function insertReplicatedChannelMessage(params: {
@@ -273,10 +295,15 @@ export interface ToolMetric {
 
 export async function logToolMetric(toolName: string, responseChars: number, responseLines: number, durationMs: number | null, isError: boolean): Promise<void> {
   initSchema();
-  const idResult = dbQuery(`SELECT nextval('metric_seq') as id`);
-  const rows = JSON.parse(idResult || "[]");
-  const id = rows[0]?.id ?? Date.now();
-  dbExec(`INSERT INTO tool_metrics (id, tool_name, response_chars, response_lines, duration_ms, is_error) VALUES (${id}, '${esc(toolName)}', ${responseChars}, ${responseLines}, ${durationMs ?? 'NULL'}, ${isError})`);
+  // Telemetry — a missing metric row should never break a live tool call.
+  try {
+    const idResult = dbQuery(`SELECT nextval('metric_seq') as id`);
+    const rows = JSON.parse(idResult || "[]");
+    const id = rows[0]?.id ?? Date.now();
+    dbExec(`INSERT INTO tool_metrics (id, tool_name, response_chars, response_lines, duration_ms, is_error) VALUES (${id}, '${esc(toolName)}', ${responseChars}, ${responseLines}, ${durationMs ?? 'NULL'}, ${isError})`);
+  } catch (e) {
+    if (!(e instanceof DbError)) throw e;
+  }
 }
 
 export async function getToolMetrics(days = 7): Promise<ToolMetric[]> {
