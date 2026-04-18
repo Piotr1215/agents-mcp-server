@@ -25,18 +25,35 @@ git clone https://github.com/Piotr1215/agents-mcp-server.git
 cd agents-mcp-server
 npm install
 npm run build
+npm link
 ```
+
+`npm link` creates `agents-mcp-server` and `snd` symlinks in your npm global bin (`$(npm config get prefix)/bin`) pointing at this repo's `build/`. That makes `.mcp.json` able to invoke `agents-mcp-server` by bare command name, and `snd` available on your `$PATH` for publishing + tailing.
+
+### Refresh after pulling updates
+
+Because `npm link` is a symlink, `build/` needs to be regenerated whenever the TypeScript source changes. The full cycle:
+
+```bash
+cd ~/dev/agents-mcp-server
+git pull
+npm install          # only if package.json changed
+npm run build        # always — regenerates build/*.js
+```
+
+Then restart any Claude session bound to `agents` so its MCP subprocess respawns against the new build. The symlinks don't need to be re-created — they already point at `build/`, which now holds the updated files.
+
+If you skip `npm run build`, symlinks still resolve to the stale JS and nothing picks up your changes. This is the single most common deploy-time confusion; rebuild, then restart.
 
 ## Configuration
 
-Add to `~/.claude/claude.json`:
+Add to `~/.claude/claude.json` (or project-local `.mcp.json`):
 
 ```json
 {
   "mcpServers": {
     "agents": {
-      "command": "node",
-      "args": ["/path/to/agents-mcp-server/build/index.js"],
+      "command": "agents-mcp-server",
       "env": {
         "AGENTS_NATS_URL": "nats://nats.example:4222"
       }
