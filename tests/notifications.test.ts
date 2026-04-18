@@ -37,15 +37,18 @@ const bcast = (o: Partial<RemoteBroadcastMessage> = {}): RemoteBroadcastMessage 
   ...o,
 });
 
+// originTs 1_700_000_000_000 → ISO 2023-11-14T22:13:20Z → HH:MM:SS "22:13:20"
+const TS_PREFIX = "22:13:20";
+
 describe("buildChannelNotification", () => {
-  it("prepends [from@host] when origin is remote", () => {
+  it("prepends <ch> <HH:MM:SS> [from@host] when origin is remote", () => {
     const out = buildChannelNotification(chan({ originHost: "host-a" }), "host-b");
-    expect(out.content).toBe("[alice-abc@host-a] hello world");
+    expect(out.content).toBe(`<ch> ${TS_PREFIX} [alice-abc@host-a] hello world`);
   });
 
-  it("prepends just [from] when origin is local", () => {
+  it("drops @host suffix for local origin", () => {
     const out = buildChannelNotification(chan({ originHost: "host-b" }), "host-b");
-    expect(out.content).toBe("[alice-abc] hello world");
+    expect(out.content).toBe(`<ch> ${TS_PREFIX} [alice-abc] hello world`);
   });
 
   it("carries full routing meta with kind=channel", () => {
@@ -61,7 +64,7 @@ describe("buildChannelNotification", () => {
 });
 
 describe("buildDmNotification", () => {
-  it("kind=dm, includes to_agent + from_agent", () => {
+  it("prepends <dm> <HH:MM:SS> [from@host] with meta", () => {
     const out = buildDmNotification(dm(), "host-b");
     expect(out.meta).toMatchObject({
       kind: "dm",
@@ -69,17 +72,22 @@ describe("buildDmNotification", () => {
       to_agent: "bob-ssh",
       origin_host: "host-a",
     });
-    expect(out.content).toBe("[alice-abc@host-a] private hello");
+    expect(out.content).toBe(`<dm> ${TS_PREFIX} [alice-abc@host-a] private hello`);
   });
 
   it("drops host suffix for same-host DMs", () => {
     const out = buildDmNotification(dm({ originHost: "host-b" }), "host-b");
-    expect(out.content).toBe("[alice-abc] private hello");
+    expect(out.content).toBe(`<dm> ${TS_PREFIX} [alice-abc] private hello`);
+  });
+
+  it("strips redundant [HUMAN] wrapper-prefix so it does not double up", () => {
+    const out = buildDmNotification(dm({ content: "[HUMAN] hello" }), "host-b");
+    expect(out.content).toBe(`<dm> ${TS_PREFIX} [alice-abc@host-a] hello`);
   });
 });
 
 describe("buildBroadcastNotification", () => {
-  it("kind=broadcast, includes group + from_agent", () => {
+  it("prepends <bcast> <HH:MM:SS> [from@host]", () => {
     const out = buildBroadcastNotification(bcast(), "host-b");
     expect(out.meta).toMatchObject({
       kind: "broadcast",
@@ -87,6 +95,6 @@ describe("buildBroadcastNotification", () => {
       group: "tasks",
       origin_host: "host-a",
     });
-    expect(out.content).toBe("[triage@host-a] new batch");
+    expect(out.content).toBe(`<bcast> ${TS_PREFIX} [triage@host-a] new batch`);
   });
 });

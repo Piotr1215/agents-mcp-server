@@ -215,6 +215,10 @@ export class NatsTransport {
         continue;
       }
       if (this.locals.has(id)) continue;
+      // Own-host peers also reach us via wildcard subscribe — drop them so
+      // agent_discover does not render local agents twice (once local, once
+      // as "remote" from our own presence beat loopback).
+      if (beat.host === this.host) continue;
       if (group && beat.group !== group) continue;
       result.push(beat);
     }
