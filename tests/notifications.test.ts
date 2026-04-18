@@ -16,6 +16,7 @@ const chan = (o: Partial<RemoteChannelMessage> = {}): RemoteChannelMessage => ({
   content: "hello world",
   originHost: "host-a",
   originTs: 1_700_000_000_000,
+  originSeq: 42,
   ...o,
 });
 
@@ -25,6 +26,7 @@ const dm = (o: Partial<RemoteDirectMessage> = {}): RemoteDirectMessage => ({
   content: "private hello",
   originHost: "host-a",
   originTs: 1_700_000_000_000,
+  originSeq: 42,
   ...o,
 });
 
@@ -34,6 +36,7 @@ const bcast = (o: Partial<RemoteBroadcastMessage> = {}): RemoteBroadcastMessage 
   content: "new batch",
   originHost: "host-a",
   originTs: 1_700_000_000_000,
+  originSeq: 42,
   ...o,
 });
 
@@ -59,6 +62,7 @@ describe("buildChannelNotification", () => {
       from_agent: "alice-abc",
       origin_host: "host-a",
       origin_ts: "1700000000000",
+      origin_seq: "42",
     });
   });
 });
@@ -71,6 +75,7 @@ describe("buildDmNotification", () => {
       from_agent: "alice-abc",
       to_agent: "bob-ssh",
       origin_host: "host-a",
+      origin_seq: "42",
     });
     expect(out.content).toBe(`<dm> ${TS_PREFIX} [alice-abc@host-a] private hello`);
   });
@@ -94,6 +99,7 @@ describe("buildBroadcastNotification", () => {
       from_agent: "triage",
       group: "tasks",
       origin_host: "host-a",
+      origin_seq: "42",
     });
     expect(out.content).toBe(`<bcast> ${TS_PREFIX} [triage@host-a] new batch`);
   });

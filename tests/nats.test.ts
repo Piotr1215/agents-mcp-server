@@ -248,6 +248,7 @@ describe("NatsTransport", () => {
         content: "hello",
         origin_host: "host-a",
         origin_ts: 42,
+        origin_seq: 0,
       });
       await t.close();
     });
@@ -356,6 +357,7 @@ describe("NatsTransport", () => {
         content: "private",
         origin_host: "host-a",
         origin_ts: 77,
+        origin_seq: 0,
       });
       await t.close();
     });
@@ -469,6 +471,7 @@ describe("NatsTransport", () => {
         content: "new task assigned",
         origin_host: "host-a",
         origin_ts: 88,
+        origin_seq: 0,
       });
       await t.close();
     });
@@ -554,6 +557,99 @@ describe("NatsTransport", () => {
         connector: async () => fakeConnection(bus),
       });
       expect(() => t.publishBroadcast("tasks", "triage", "hi")).not.toThrow();
+    });
+  });
+
+  describe("origin_seq tie-breaker", () => {
+    it("emits strictly monotonic origin_seq within a single now() tick across all three publish methods", async () => {
+      const seen: Array<{ subject: string; payload: any }> = [];
+      bus.subscribe((subject, data) => {
+        if (
+          subject.startsWith("agents.dm.") ||
+          subject.startsWith("agents.broadcast.") ||
+          subject.startsWith("agents.channel.")
+        ) {
+          seen.push({ subject, payload: JSON.parse(Buffer.from(data).toString("utf-8")) });
+        }
+      });
+      const t = new NatsTransport({
+        url: "fake",
+        host: "host-a",
+        connector: async () => fakeConnection(bus),
+        now: () => 1_000, // frozen — every publish shares this origin_ts
+      });
+      await t.start();
+
+      t.publishDirectMessage("bob", "alice", "msg1");
+      t.publishBroadcast("default", "alice", "msg2");
+      t.publishChannelMessage("#eng", "alice", "msg3");
+      t.publishDirectMessage("bob", "alice", "msg4");
+
+      expect(seen).toHaveLength(4);
+      // All share the same origin_ts — so sort stability depends on origin_seq.
+      expect(new Set(seen.map((s) => s.payload.origin_ts))).toEqual(new Set([1_000]));
+      // Strictly monotonic, starting at 0, single counter spanning all publish kinds.
+      expect(seen.map((s) => s.payload.origin_seq)).toEqual([0, 1, 2, 3]);
+
+      await t.close();
+    });
+
+    it("carries origin_seq through the consumer callback", async () => {
+      const received: RemoteDirectMessage[] = [];
+      const recv = new NatsTransport({
+        url: "fake",
+        host: "host-b",
+        onDirectMessage: (m) => { received.push(m); },
+        connector: async () => fakeConnection(bus),
+        now: () => 100,
+      });
+      await recv.start();
+
+      const sender = new NatsTransport({
+        url: "fake",
+        host: "host-a",
+        connector: async () => fakeConnection(bus),
+        now: () => 50,
+      });
+      await sender.start();
+      sender.publishDirectMessage("bob", "alice", "first");
+      sender.publishDirectMessage("bob", "alice", "second");
+
+      await new Promise((r) => setTimeout(r, 10));
+      expect(received).toHaveLength(2);
+      expect(received[0].originSeq).toBe(0);
+      expect(received[1].originSeq).toBe(1);
+
+      await sender.close();
+      await recv.close();
+    });
+
+    it("falls back to 0 on the consumer side when a legacy payload omits origin_seq", async () => {
+      const received: RemoteDirectMessage[] = [];
+      const recv = new NatsTransport({
+        url: "fake",
+        host: "host-b",
+        onDirectMessage: (m) => { received.push(m); },
+        connector: async () => fakeConnection(bus),
+        now: () => 100,
+      });
+      await recv.start();
+
+      // Older publisher wire format: no origin_seq field.
+      const subject = "agents.dm." + Buffer.from("bob", "utf-8").toString("base64url");
+      bus.publish(subject, Buffer.from(JSON.stringify({
+        to_agent: "bob",
+        from_agent: "alice",
+        content: "legacy",
+        origin_host: "host-a",
+        origin_ts: 50,
+      })));
+
+      await new Promise((r) => setTimeout(r, 10));
+      expect(received).toHaveLength(1);
+      expect(received[0].originSeq).toBe(0);
+
+      await recv.close();
     });
   });
 });
