@@ -18,42 +18,54 @@ Built following [Block's MCP Playbook](https://engineering.block.xyz/blog/blocks
 - DuckDB CLI
 - A NATS server reachable via `AGENTS_NATS_URL`
 
-## Installation
+## Install / Update
+
+One command, idempotent — works the same on first install and for every subsequent update:
 
 ```bash
-git clone https://github.com/Piotr1215/agents-mcp-server.git
-cd agents-mcp-server
-npm install
-npm run build
-npm link
+curl -fsSL https://raw.githubusercontent.com/Piotr1215/agents-mcp-server/main/scripts/install.sh \
+  | bash -s -- --nats-url=nats://your-endpoint:4222
 ```
 
-`npm link` creates `agents-mcp-server` and `snd` symlinks in your npm global bin (`$(npm config get prefix)/bin`) pointing at this repo's `build/`. That makes `.mcp.json` able to invoke `agents-mcp-server` by bare command name, and `snd` available on your `$PATH` for publishing + tailing.
-
-### Refresh after pulling updates
-
-Because `npm link` is a symlink, `build/` needs to be regenerated whenever the TypeScript source changes. The full cycle:
+On update, `--nats-url` is optional — the existing endpoint in `~/.claude.json` is preserved:
 
 ```bash
-cd ~/dev/agents-mcp-server
-git pull
-npm install          # only if package.json changed
-npm run build        # always — regenerates build/*.js
+curl -fsSL https://raw.githubusercontent.com/Piotr1215/agents-mcp-server/main/scripts/install.sh | bash
 ```
 
-Then restart any Claude session bound to `agents` so its MCP subprocess respawns against the new build. The symlinks don't need to be re-created — they already point at `build/`, which now holds the updated files.
+Then `/mcp` reconnect in any active Claude session (or relaunch `claude`). That's it.
 
-If you skip `npm run build`, symlinks still resolve to the stale JS and nothing picks up your changes. This is the single most common deploy-time confusion; rebuild, then restart.
+What the installer does:
+
+1. Verifies prereqs: `git`, `node >= 18`, `npm`, `duckdb`, `jq`. Hard-fails with a clear message if any are missing.
+2. Clones (first run) or fast-forward pulls (subsequent runs) into `~/.local/share/agents-mcp-server` (override with `--dir` or `AGENTS_MCP_DIR`).
+3. Runs `npm install`, which triggers the `prepare` script (`tsc`) — **no manual `npm run build` step**, ever.
+4. Writes/updates the `mcpServers.agents` entry in `~/.claude.json` using `jq` (idempotent, preserves every other entry). Backs up the file to `~/.claude.json.bak-<epoch>` before writing.
+
+### Prefer to review before running
+
+Same effect, more paranoid:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Piotr1215/agents-mcp-server/main/scripts/install.sh -o install.sh
+less install.sh
+bash install.sh --nats-url=nats://your-endpoint:4222
+```
+
+### Local development
+
+For hacking on the server itself, clone the repo directly and use npm link as before — the `prepare` script means every `npm install` rebuilds, and `npm run build` / `npm test` still work normally. Only the symlink-path `.claude.json` entry needs adjusting to point at your dev checkout.
 
 ## Configuration
 
-Add to `~/.claude/claude.json` (or project-local `.mcp.json`):
+The installer writes this automatically. Shown here for reference:
 
 ```json
 {
   "mcpServers": {
     "agents": {
-      "command": "agents-mcp-server",
+      "command": "node",
+      "args": ["/home/you/.local/share/agents-mcp-server/build/index.js"],
       "env": {
         "AGENTS_NATS_URL": "nats://nats.example:4222"
       }
@@ -62,11 +74,11 @@ Add to `~/.claude/claude.json` (or project-local `.mcp.json`):
 }
 ```
 
-`AGENTS_NATS_URL` is **required**. The server is now single-bus: DMs, channels, broadcasts, and presence all go through NATS. Legacy tmux `snd` injection is gone. Sessions that want real-time inbound delivery must also launch the `comms` source (see below); without it, messages still persist to DuckDB (`dm_history`, `channel_history`, `group_history`) but do not push live.
+`AGENTS_NATS_URL` is **required** — the server is single-bus: DMs, channels, broadcasts, and presence all flow through NATS. Session push lights up on `agent_register`; before that the session is send-only and all traffic still lands in DuckDB for `*_history` reads.
 
 ## `snd` CLI
 
-After `npm run build && npm link`, `snd` is on your `$PATH`:
+`snd` is published by the installer as a bin alongside the server:
 
 ```
 snd <agent> <msg...>          DM to agent
@@ -77,46 +89,17 @@ snd --human … <msg...>        prefix payload with [HUMAN] (wrapper does this f
 
 Only dependency is `AGENTS_NATS_URL`. One binary, one code path, callable from cron, shells, editor plugins.
 
-## Real-time session push (comms)
+## Real-time session push
 
-Channels, DMs, and group broadcasts are async by default — writers hit DuckDB and readers pull via `channel_history` / `dm_history` / `group_history`. For live inbound pushed straight into an open Claude Code session, run the `comms` server as a [Claude Code Channels source](https://code.claude.com/docs/en/channels.md).
+`agent_register` both joins the conversation and binds the session's identity. From that point on, in the same process:
 
-Add an entry to your `.mcp.json`:
+- DMs where `to_agent == your name` arrive as `<channel source="agents" kind="dm" …>` tags.
+- Broadcasts where `group == your group` arrive as `<channel source="agents" kind="broadcast" …>` tags.
+- Channel posts arrive as `<channel source="agents" kind="channel" …>` tags.
 
-```json
-{
-  "mcpServers": {
-    "comms": {
-      "command": "node",
-      "args": ["/path/to/agents-mcp-server/build/comms.js"],
-      "env": {
-        "AGENTS_NATS_URL": "nats://nats.example:4222"
-      }
-    }
-  }
-}
-```
+No second MCP process, no `comms_bind` call — the tools process and the channel source are the same binary. Echo suppression happens at the handler: you never see your own outbound message pushed back at you.
 
-Launch Claude Code with comms enabled:
-
-```bash
-claude --dangerously-load-development-channels server:comms
-```
-
-Identity is bound at runtime — not at launch — because agent names are set by slash commands inside a session, long after the subprocess has spawned. Right after `agent_register`, the session calls:
-
-```
-comms_bind(name: "YOUR_NAME", group: "YOUR_GROUP")
-```
-
-From then on:
-- DMs where `to_agent == YOUR_NAME` arrive as `<channel source="comms" kind="dm" …>` tags.
-- Broadcasts where `group == YOUR_GROUP` arrive as `<channel source="comms" kind="broadcast" …>` tags.
-- Channel posts (public bulletin boards) always arrive as `<channel source="comms" kind="channel" …>` tags — they don't require binding.
-
-Before `comms_bind` is called, only channel posts flow through. DMs and broadcasts stay off the wire until the session declares identity, so nothing leaks across agents that share a host.
-
-Own-host echoes are filtered in the receive loop so a publisher doesn't receive its own message back as a tag.
+Sessions that haven't called `agent_register` yet stay send-only; inbound still lands in DuckDB for catch-up reads via `channel_history` / `dm_history` / `group_history`, so nothing is lost.
 
 ## Tools
 
@@ -226,23 +209,25 @@ Analyze tool usage over time.
 
 ## How It Works
 
-Three layers. The first runs standalone; the other two light up when `AGENTS_NATS_URL` is set.
+Single bus: everything (presence, DMs, broadcasts, channel posts) flows through NATS on `AGENTS_NATS_URL`. Local DuckDB is a per-host cache for history reads, not a delivery plane.
 
-### Local (always on)
+### State & persistence
 
-1. Agents register via `agent_register` — stored in DuckDB.
-2. An MCP hook captures the caller's tmux `pane_id` for delivery.
-3. `agent_broadcast` and `agent_dm` are pushed via `snd --pane <target> <message>` — direct tmux keystroke injection.
-4. Every message is logged to DuckDB with timestamps; `tool_metrics` reports usage.
+1. `agent_register` inserts a row in DuckDB; that row is the binding between agent name and the current session.
+2. Every outbound `agent_broadcast` / `agent_dm` / `channel_send` writes to the local DuckDB so `*_history` tools keep working offline.
+3. Inbound messages from other hosts are mirrored into the local DuckDB on receive (same-host echoes skip the write — the publisher already stored the row).
+4. `tool_metrics` reports per-tool usage from that same DuckDB.
 
-### NATS transport (cross-host state)
+### NATS transport (delivery plane)
 
-When `AGENTS_NATS_URL` is set, two extra things happen on the tools MCP (`build/index.js`):
+When the server starts with `AGENTS_NATS_URL`, four subjects light up:
 
-- **Presence**: every registered agent publishes a beat on `agents.presence` every 10s, with 30s TTL. `agent_discover` merges remote peers from the cache, tagged `host: <hostname> | remote`.
-- **Channel replication**: `channel_send` publishes to `agents.channel.<base64url(name)>` in addition to writing the local row. Every host subscribes to `agents.channel.*` and upserts incoming messages into its own DuckDB (own-host echoes filtered). `channel_history` reads from the local DB and therefore sees cross-host traffic without changes.
+- **Presence** — every registered agent publishes a beat on `agents.presence` every 10s, TTL 30s. `agent_discover` merges remote peers from the cache.
+- **Channel posts** — `channel_send` publishes to `agents.channel.<base64url(name)>`. All hosts subscribe and replicate into their local DuckDB so `channel_history` sees cross-host traffic.
+- **DMs** — `agent_dm` publishes to `agents.dm.<base64url(to_agent)>`. Delivery is uniform: same-host and cross-host take the same path.
+- **Broadcasts** — `agent_broadcast` publishes to `agents.broadcast.<base64url(group)>`. Group-bound sessions receive as `<channel kind="broadcast">`.
 
-DMs and broadcasts are not yet routed over NATS — they stay local-tmux until the next phase.
+Sessions bound via `agent_register` get DMs and broadcasts pushed straight into the transcript as `<channel>` tags — no polling. The publisher's own messages are filtered at the handler so you don't see yourself echoed back.
 
 ### Channels source (real-time session push)
 
