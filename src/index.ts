@@ -626,15 +626,25 @@ async function main() {
       url: natsUrl,
       onChannelMessage: async (msg) => {
         try {
-          await db.insertReplicatedChannelMessage({
-            channel: msg.channel,
-            fromAgent: msg.fromAgent,
-            content: msg.content,
-            originHost: msg.originHost,
-          });
+          // Same-host messages were already persisted by the publisher's tool
+          // handler. Skip the write to avoid a duplicate row in the shared DB
+          // when multiple agent-mcp-server processes run on one host (tmux
+          // panes, k8s pods). Cross-host messages still replicate into the
+          // receiver's local DB as before.
+          const isOwnHost = natsTransport?.getHost() === msg.originHost;
+          if (!isOwnHost) {
+            await db.insertReplicatedChannelMessage({
+              channel: msg.channel,
+              fromAgent: msg.fromAgent,
+              content: msg.content,
+              originHost: msg.originHost,
+            });
+          }
           logToFile("CHANNEL", `#${msg.channel} ${msg.fromAgent}@${msg.originHost}: ${msg.content}`);
-          // Channel posts are public — push to every bound session.
-          if (sessionBinding && natsTransport) {
+          // Push to every bound session except the sender's own, so the
+          // publisher doesn't see their own post echoed back.
+          const isSelf = !!sessionBinding && (msg.fromAgent === sessionBinding.name || msg.fromAgent === sessionBinding.agentId);
+          if (sessionBinding && natsTransport && !isSelf) {
             const params = buildChannelNotification(msg, natsTransport.getHost());
             await server.server.notification({ method: CHANNEL_METHOD, params });
           }
@@ -644,15 +654,20 @@ async function main() {
       },
       onDirectMessage: async (msg) => {
         try {
-          await db.insertReplicatedDm({
-            toAgent: msg.toAgent,
-            fromAgent: msg.fromAgent,
-            content: msg.content,
-            originHost: msg.originHost,
-          });
+          const isOwnHost = natsTransport?.getHost() === msg.originHost;
+          if (!isOwnHost) {
+            await db.insertReplicatedDm({
+              toAgent: msg.toAgent,
+              fromAgent: msg.fromAgent,
+              content: msg.content,
+              originHost: msg.originHost,
+            });
+          }
           logToFile("DM", `${msg.fromAgent}@${msg.originHost} -> ${msg.toAgent}: ${msg.content}`);
-          // Private: push only when addressed to the session's bound identity.
-          if (sessionBinding && natsTransport && msg.toAgent === sessionBinding.name) {
+          // Push only when addressed to the session's bound identity, and not
+          // when we are the sender (the tool handler already returned).
+          const isSelf = !!sessionBinding && (msg.fromAgent === sessionBinding.name || msg.fromAgent === sessionBinding.agentId);
+          if (sessionBinding && natsTransport && msg.toAgent === sessionBinding.name && !isSelf) {
             const params = buildDmNotification(msg, natsTransport.getHost());
             await server.server.notification({ method: CHANNEL_METHOD, params });
           }
@@ -662,15 +677,21 @@ async function main() {
       },
       onBroadcast: async (msg) => {
         try {
-          await db.insertReplicatedBroadcast({
-            group: msg.group,
-            fromAgent: msg.fromAgent,
-            content: msg.content,
-            originHost: msg.originHost,
-          });
+          const isOwnHost = natsTransport?.getHost() === msg.originHost;
+          if (!isOwnHost) {
+            await db.insertReplicatedBroadcast({
+              group: msg.group,
+              fromAgent: msg.fromAgent,
+              content: msg.content,
+              originHost: msg.originHost,
+            });
+          }
           logToFile("BROADCAST", `${msg.fromAgent}@${msg.originHost} -> ${msg.group}: ${msg.content}`);
-          // Push if the bound group matches the broadcast target.
-          if (sessionBinding && natsTransport && msg.group === sessionBinding.group) {
+          // Push if the bound group matches the broadcast target and we are
+          // not the sender. Same-host peers must land here — the old
+          // transport-level own-host filter silently dropped them (issue #127).
+          const isSelf = !!sessionBinding && (msg.fromAgent === sessionBinding.name || msg.fromAgent === sessionBinding.agentId);
+          if (sessionBinding && natsTransport && msg.group === sessionBinding.group && !isSelf) {
             const params = buildBroadcastNotification(msg, natsTransport.getHost());
             await server.server.notification({ method: CHANNEL_METHOD, params });
           }

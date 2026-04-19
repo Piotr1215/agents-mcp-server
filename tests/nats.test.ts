@@ -286,7 +286,13 @@ describe("NatsTransport", () => {
       await recv.close();
     });
 
-    it("skips own-host echoes in receive loop", async () => {
+    // Issue #127: the transport used to silently drop same-host messages to
+    // avoid the publisher's own echo. That broke multi-agent-per-host
+    // deployments (tmux panes, k8s pods sharing a hostname) because every peer
+    // on the same host saw `origin_host === this.host` and was filtered out.
+    // Transport now delivers every message; echo suppression moved into the
+    // handler in src/index.ts where sessionBinding is available.
+    it("delivers same-host messages to the callback (handler handles echo suppression)", async () => {
       const received: RemoteChannelMessage[] = [];
       const t = new NatsTransport({
         url: "fake",
@@ -298,7 +304,8 @@ describe("NatsTransport", () => {
       await t.start();
       t.publishChannelMessage("#eng", "alice-abc", "loopback-test");
       await new Promise((r) => setTimeout(r, 10));
-      expect(received).toHaveLength(0);
+      expect(received).toHaveLength(1);
+      expect(received[0].originHost).toBe("host-a");
       await t.close();
     });
 
@@ -395,7 +402,8 @@ describe("NatsTransport", () => {
       await recv.close();
     });
 
-    it("skips own-host echoes in DM receive loop", async () => {
+    // See channel pub/sub section for the #127 rationale — same shape here.
+    it("delivers same-host DMs to the callback (handler handles echo suppression)", async () => {
       const received: RemoteDirectMessage[] = [];
       const t = new NatsTransport({
         url: "fake",
@@ -407,7 +415,8 @@ describe("NatsTransport", () => {
       await t.start();
       t.publishDirectMessage("bob-ssh", "alice-abc", "loopback");
       await new Promise((r) => setTimeout(r, 10));
-      expect(received).toHaveLength(0);
+      expect(received).toHaveLength(1);
+      expect(received[0].originHost).toBe("host-a");
       await t.close();
     });
 
@@ -509,7 +518,8 @@ describe("NatsTransport", () => {
       await recv.close();
     });
 
-    it("skips own-host echoes in broadcast receive loop", async () => {
+    // See channel pub/sub section for the #127 rationale — same shape here.
+    it("delivers same-host broadcasts to the callback (handler handles echo suppression)", async () => {
       const received: RemoteBroadcastMessage[] = [];
       const t = new NatsTransport({
         url: "fake",
@@ -521,8 +531,45 @@ describe("NatsTransport", () => {
       await t.start();
       t.publishBroadcast("tasks", "triage-abc", "loopback");
       await new Promise((r) => setTimeout(r, 10));
-      expect(received).toHaveLength(0);
+      expect(received).toHaveLength(1);
+      expect(received[0].originHost).toBe("host-a");
       await t.close();
+    });
+
+    // Issue #127 regression: two independent transports sharing a hostname
+    // (tmux panes on one laptop, pods on one k8s node) used to never see each
+    // other's broadcasts because the receiver filtered on origin_host. The
+    // publisher is now visible to the same-host peer.
+    it("delivers broadcasts between two transports sharing a host", async () => {
+      const received: RemoteBroadcastMessage[] = [];
+      const recv = new NatsTransport({
+        url: "fake",
+        host: "shared-host",
+        onBroadcast: (m) => { received.push(m); },
+        connector: async () => fakeConnection(bus),
+        now: () => 1_000,
+      });
+      await recv.start();
+
+      const sender = new NatsTransport({
+        url: "fake",
+        host: "shared-host",
+        connector: async () => fakeConnection(bus),
+        now: () => 2_000,
+      });
+      await sender.start();
+      sender.publishBroadcast("tasks", "peer-abc", "hi same-host neighbor");
+
+      await new Promise((r) => setTimeout(r, 10));
+      expect(received).toHaveLength(1);
+      expect(received[0]).toMatchObject({
+        group: "tasks",
+        fromAgent: "peer-abc",
+        content: "hi same-host neighbor",
+        originHost: "shared-host",
+      });
+      await sender.close();
+      await recv.close();
     });
 
     it("drops broadcast payloads missing required fields", async () => {
