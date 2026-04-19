@@ -75,6 +75,14 @@ function initSchema(): void {
     -- stable_pane were tmux artifacts from the pre-NATS delivery era. The
     -- server now lives strictly in the remote plane — comms handles push,
     -- snd handles publish, neither cares about panes.
+    --
+    -- DuckDB rejects ALTER TABLE DROP COLUMN when *any* index exists on the
+    -- table ("Cannot alter entry 'agents' because there are entries that
+    -- depend on it"), even if the index doesn't reference the dropped
+    -- column. Fresh installs don't hit this (no pre-existing index at ALTER
+    -- time), but grandfathered DBs that already built idx_agents_name on a
+    -- prior boot fail every startup until the index is dropped first.
+    DROP INDEX IF EXISTS idx_agents_name;
     ALTER TABLE agents DROP COLUMN IF EXISTS pane_id;
     ALTER TABLE agents DROP COLUMN IF EXISTS stable_pane;
     CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_name ON agents(name);
