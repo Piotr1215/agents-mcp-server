@@ -1,8 +1,14 @@
 // DuckDB backend for agent communication
 // Uses CLI instead of library to avoid lock issues
 import { execSync } from "child_process";
+import { homedir } from "os";
+import { join, dirname } from "path";
+import { mkdirSync } from "fs";
 
-const DB_PATH = process.env.AGENTS_DB_PATH || "/home/decoder/.claude/data/agents.duckdb";
+// Default under $HOME so the server boots on any Linux/macOS account without
+// AGENTS_DB_PATH. Previously hardcoded to /home/decoder/... which broke every
+// other user and every root/container install.
+const DB_PATH = process.env.AGENTS_DB_PATH || join(homedir(), ".claude", "data", "agents.duckdb");
 
 let initialized = false;
 
@@ -64,6 +70,10 @@ function dbExec(sql: string, retries = 5): void {
 
 function initSchema(): void {
   if (initialized) return;
+  // duckdb CLI refuses to open a file under a missing directory. Create the
+  // parent on first boot so fresh accounts (no ~/.claude/data yet) don't need
+  // any pre-step from the installer.
+  mkdirSync(dirname(DB_PATH), { recursive: true });
   dbExec(`
     CREATE TABLE IF NOT EXISTS agents (
       id VARCHAR PRIMARY KEY,
