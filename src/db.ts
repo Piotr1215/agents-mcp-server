@@ -122,6 +122,14 @@ function initSchema(): void {
   initialized = true;
 }
 
+// Allowlist of message.type values. Guards against the arg-order class of bug
+// that produced Piotr1215/claude#116's 42 type='human' rows: a caller passing
+// the sender name where the type was expected silently INSERTed garbage, and
+// every history / type-distribution query downstream had to filter it out.
+export const VALID_MESSAGE_TYPES = ["DM", "BROADCAST", "CHANNEL", "LEFT", "JOINED"] as const;
+export type MessageType = typeof VALID_MESSAGE_TYPES[number];
+const validTypeSet = new Set<string>(VALID_MESSAGE_TYPES);
+
 // For server startup
 export async function getDb(): Promise<void> {
   initSchema();
@@ -195,6 +203,15 @@ export async function setCommsBound(name: string, bound: boolean): Promise<void>
 
 export async function logMessage(type: string, from: string | null, to: string | null, channel: string | null, content: string, originHost: string | null = null): Promise<number> {
   initSchema();
+  // Reject types outside the allowlist at the boundary, not after insert.
+  // Historically an arg-order bug upstream passed the sender name here and
+  // we silently wrote type='human' rows (#116, cleaned up in the migration
+  // above). A loud stderr + short-circuit is cheaper than hunting orphan
+  // rows later.
+  if (!validTypeSet.has(type)) {
+    console.error(`[db] logMessage: rejecting invalid type '${type}' (expected one of ${VALID_MESSAGE_TYPES.join(", ")}); content preview: ${content.slice(0, 60)}`);
+    return -1;
+  }
   // Best-effort: the canonical delivery path is NATS. If logging fails we
   // still want the DM/broadcast to have been delivered, not to throw up the
   // stack and mislead the caller into thinking the send itself failed. The
