@@ -337,6 +337,14 @@ export class NatsTransport {
     }
   }
 
+  // Receive paths deliver every message to their handler, including own-host
+  // echoes. Echo suppression lives in the handler — not here — because multiple
+  // independent agent-mcp-server processes can share a hostname (tmux panes on
+  // one laptop, pods on one k8s node), and a hostname-level filter silently
+  // drops legitimate peer traffic. The handler decides per message whether to
+  // write to the shared DB (skip when origin_host matches, since the publisher
+  // already wrote) and whether to push to the bound session (skip only when
+  // from_agent is this session's own identity).
   private async consumeChannel(sub: Subscription): Promise<void> {
     for await (const msg of sub) {
       try {
@@ -352,8 +360,6 @@ export class NatsTransport {
           console.error("[nats] bad channel payload: missing fields");
           continue;
         }
-        // Skip our own echoes — we already wrote them locally before publish.
-        if (raw.origin_host === this.host) continue;
         await this.onChannelMessage({
           channel: raw.channel,
           fromAgent: raw.from_agent ?? "unknown",
@@ -383,8 +389,6 @@ export class NatsTransport {
           console.error("[nats] bad dm payload: missing fields");
           continue;
         }
-        // Skip our own echoes — publishing host already delivered locally.
-        if (raw.origin_host === this.host) continue;
         await this.onDirectMessage({
           toAgent: raw.to_agent,
           fromAgent: raw.from_agent,
@@ -414,7 +418,6 @@ export class NatsTransport {
           console.error("[nats] bad broadcast payload: missing fields");
           continue;
         }
-        if (raw.origin_host === this.host) continue;
         await this.onBroadcast({
           group: raw.group,
           fromAgent: raw.from_agent,
