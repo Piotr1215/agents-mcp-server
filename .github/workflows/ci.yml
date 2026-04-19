@@ -67,18 +67,15 @@ jobs:
             || { echo "AGENTS_NATS_URL not written"; exit 1; }
 
       - name: Boot server and assert clean startup
+        # Boots the compiled server and checks that its ready banner lands in
+        # stderr within 5s. An MCP stdio server exits normally when stdin hits
+        # EOF (no client attached), so liveness checks after the boot are the
+        # wrong signal — we only care that it initialized without crashing.
         # Proves src/db.ts mkdir + homedir default work on a fresh account
-        # with no ~/.claude/data. The server waits for stdin, so a short
-        # timeout is expected; we just need it not to crash during init.
+        # with no pre-existing ~/.claude/data directory.
         run: |
           timeout 5 node "$RUNNER_TEMP/agents-mcp-server/build/index.js" \
-            > /tmp/server.out 2>&1 &
-          pid=$!
-          sleep 3
-          if ! kill -0 $pid 2>/dev/null; then
-            echo "server exited prematurely:"; cat /tmp/server.out; exit 1
-          fi
-          kill $pid 2>/dev/null || true
+            > /tmp/server.out 2>&1 || true
           grep -q "agents MCP" /tmp/server.out \
             || { echo "ready banner missing:"; cat /tmp/server.out; exit 1; }
 
