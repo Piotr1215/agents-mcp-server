@@ -29,3 +29,73 @@ jobs:
 
       - name: Test
         run: npm test
+
+  install-script:
+    # End-to-end exercise of scripts/install.sh on a clean runner. Catches
+    # regressions that the unit tests miss: hardcoded paths, missing prereq
+    # checks, config-write bugs, update-path break. Separate job so a clean
+    # runner always runs — no interference with the build job's state.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install prereqs (duckdb, jq, git)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq git
+          curl -fsSL https://install.duckdb.org | sh
+          echo "$HOME/.duckdb/cli/latest" >> $GITHUB_PATH
+
+      - name: Fresh install from PR branch
+        env:
+          AGENTS_MCP_REPO: ${{ github.server_url }}/${{ github.repository }}.git
+          AGENTS_MCP_BRANCH: ${{ github.head_ref || github.ref_name }}
+          AGENTS_MCP_DIR: ${{ runner.temp }}/agents-mcp-server
+        run: bash scripts/install.sh --nats-url=nats://ci.example:4222
+
+      - name: Verify install artifacts
+        run: |
+          test -f "$RUNNER_TEMP/agents-mcp-server/build/index.js" \
+            || { echo "build/index.js missing"; exit 1; }
+          jq -e '.mcpServers.agents.args[0] | endswith("/build/index.js")' ~/.claude.json \
+            || { echo "mcpServers.agents entry malformed"; cat ~/.claude.json; exit 1; }
+          jq -e '.mcpServers.agents.env.AGENTS_NATS_URL == "nats://ci.example:4222"' ~/.claude.json \
+            || { echo "AGENTS_NATS_URL not written"; exit 1; }
+
+      - name: Boot server and assert clean startup
+        # Boots the compiled server and checks that its ready banner lands in
+        # stderr within 5s. An MCP stdio server exits normally when stdin hits
+        # EOF (no client attached), so liveness checks after the boot are the
+        # wrong signal — we only care that it initialized without crashing.
+        # Proves src/db.ts mkdir + homedir default work on a fresh account
+        # with no pre-existing ~/.claude/data directory.
+        run: |
+          timeout 5 node "$RUNNER_TEMP/agents-mcp-server/build/index.js" \
+            > /tmp/server.out 2>&1 || true
+          grep -q "agents MCP" /tmp/server.out \
+            || { echo "ready banner missing:"; cat /tmp/server.out; exit 1; }
+
+      - name: Update path (re-run installer with no args)
+        run: bash scripts/install.sh
+
+      - name: Verify config preserved across update
+        run: |
+          jq -e '.mcpServers.agents.env.AGENTS_NATS_URL == "nats://ci.example:4222"' ~/.claude.json \
+            || { echo "update overwrote nats URL"; exit 1; }
+
+      - name: Fail-fast when a prereq is missing
+        # Installer must hard-error (non-zero) with a clear message instead
+        # of limping forward. Simulate by hiding duckdb on PATH.
+        run: |
+          cleaned_path=$(echo "$PATH" | tr ':' '\n' | grep -v duckdb | paste -sd ':')
+          set +e
+          PATH="$cleaned_path" bash scripts/install.sh --nats-url=nats://ci.example:4222 2> /tmp/err.log
+          rc=$?
+          set -e
+          test $rc -ne 0 || { echo "installer returned 0 when duckdb was missing"; exit 1; }
+          grep -q "duckdb" /tmp/err.log \
+            || { echo "error message did not name the missing tool:"; cat /tmp/err.log; exit 1; }
