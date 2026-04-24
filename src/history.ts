@@ -114,7 +114,9 @@ async function drain(filterSubjects: string[], limit: number, minSeq?: number): 
   const out: RawEnvelope[] = [];
   try {
     const consumer = await js.consumers.get(STREAM_NAME, consumerName);
-    const iter = await consumer.fetch({ max_messages: limit, expires: 500 });
+    // nats.js rejects expires < 1000ms. Keep this tight enough that history
+    // queries don't stall on empty streams, but above the client's floor.
+    const iter = await consumer.fetch({ max_messages: limit, expires: 1000 });
     for await (const m of iter) {
       try {
         const payload = JSON.parse(Buffer.from(m.data).toString("utf-8"));
