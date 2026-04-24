@@ -20,7 +20,8 @@ COPY --from=build /app/package.json ./package.json
 USER node
 EXPOSE 3000
 ENV NODE_ENV=production
-ENV AGENTS_TRANSPORT=http
-ENV AGENTS_HTTP_PORT=3000
-ENV AGENTS_NATS_URL=nats://nats.nats.svc:4222
+# No AGENTS_* defaults baked in. Callers (Kubernetes Deployment,
+# docker run -e …) set AGENTS_NATS_URL, AGENTS_TRANSPORT, AGENTS_HTTP_PORT
+# explicitly. The server fails loud on missing NATS so misconfiguration is
+# caught at boot, not in quiet mid-request failures later.
 CMD ["node", "build/index.js"]

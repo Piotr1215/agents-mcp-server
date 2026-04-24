@@ -1,24 +1,37 @@
 # Agents MCP Server
 
-MCP server for agent-to-agent communication over NATS with live session push via Claude Code Channels. State lives in local DuckDB; transport is single-bus (`AGENTS_NATS_URL`); delivery is uniform for local and cross-host targets.
+MCP server for agent-to-agent communication over NATS with live session push via Claude Code Channels. State is in-memory; history lives on a JetStream stream; transport is single-bus (`AGENTS_NATS_URL`); delivery is uniform for local and cross-host targets. Runs as stdio (one process per user) or as a shared remote server over streamable HTTP.
 
 ## Design Principles
 
 Built following [Block's MCP Playbook](https://engineering.block.xyz/blog/blocks-playbook-for-designing-mcp-servers):
 
-1. **Outcomes, not operations** - One tool = one agent story
-2. **Flatten arguments** - Primitives, enums, strong defaults
-3. **Instructions are context** - Descriptions are prompts for LLMs
-4. **Respect token budget** - Self-report `_meta`, track metrics
-5. **Curate ruthlessly** - Fewer tools = less LLM decision overhead
+1. **Outcomes, not operations** — one tool = one agent story
+2. **Flatten arguments** — primitives, enums, strong defaults
+3. **Instructions are context** — descriptions are prompts for LLMs
+4. **Respect token budget** — every response reports `_meta: {chars, lines, ms}`
+5. **Curate ruthlessly** — fewer tools = less LLM decision overhead
 
 ## Prerequisites
 
-- Node.js >= 18
-- DuckDB CLI
-- A NATS server reachable via `AGENTS_NATS_URL`
+- A NATS server reachable via `AGENTS_NATS_URL`, with JetStream enabled
+- For **local stdio** use: Node.js >= 18
+- For **remote HTTP** deploys: a container runtime (Docker / Kubernetes)
 
-## Install / Update
+No DuckDB, no on-disk state, no schema migrations.
+
+## Transports
+
+The server picks its transport at boot via `AGENTS_TRANSPORT`:
+
+| Mode | Value | Use case |
+|---|---|---|
+| stdio (default) | `stdio` | One MCP process per user, spawned by Claude Code over stdin/stdout |
+| HTTP | `http` | Single shared process fronted by streamable HTTP; each Claude Code session negotiates its own binding |
+
+Stdio binding is implicit from the moment `agent_register` is called; HTTP binding is per-session (each connected client carries its own `sessionBinding`). In both modes, the same tool set and the same NATS subjects are in use — callers see no semantic difference.
+
+## Install / Update (local stdio)
 
 One command, idempotent — works the same on first install and for every subsequent update:
 
@@ -37,14 +50,12 @@ Then `/mcp` reconnect in any active Claude session (or relaunch `claude`). That'
 
 What the installer does:
 
-1. Verifies prereqs: `git`, `node >= 18`, `npm`, `duckdb`, `jq`. Hard-fails with a clear message if any are missing.
+1. Verifies prereqs: `git`, `node >= 18`, `npm`, `jq`. Hard-fails with a clear message if any are missing.
 2. Clones (first run) or fast-forward pulls (subsequent runs) into `~/.local/share/agents-mcp-server` (override with `--dir` or `AGENTS_MCP_DIR`).
 3. Runs `npm install`, which triggers the `prepare` script (`tsc`) — **no manual `npm run build` step**, ever.
 4. Writes/updates the `mcpServers.agents` entry in `~/.claude.json` using `jq` (idempotent, preserves every other entry). Backs up the file to `~/.claude.json.bak-<epoch>` before writing.
 
 ### Prefer to review before running
-
-Same effect, more paranoid:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Piotr1215/agents-mcp-server/main/scripts/install.sh -o install.sh
@@ -54,27 +65,48 @@ bash install.sh --nats-url=nats://your-endpoint:4222
 
 ### Local development
 
-For hacking on the server itself, clone the repo directly and use npm link as before — the `prepare` script means every `npm install` rebuilds, and `npm run build` / `npm test` still work normally. Only the symlink-path `.claude.json` entry needs adjusting to point at your dev checkout.
+Clone the repo directly and use npm link. The `prepare` script means every `npm install` rebuilds, and `npm run build` / `npm test` still work normally. Only the symlink-path `.claude.json` entry needs adjusting to point at your dev checkout.
 
-## Configuration
+## Remote HTTP deploy
 
-The installer writes this automatically. Shown here for reference:
+Published as a Docker image for shared deployments (homelab proving ground, loft.rocks rollout, per [#124](https://github.com/Piotr1215/claude/issues/124)):
+
+```
+piotrzan/agents-mcp-server:<version>
+```
+
+The image bakes in no `AGENTS_*` defaults — callers (Kubernetes Deployment, `docker run -e …`) set `AGENTS_NATS_URL`, `AGENTS_TRANSPORT`, and `AGENTS_HTTP_PORT` explicitly. The server fails loud on missing NATS so misconfiguration is caught at boot.
+
+Exposed endpoints:
+
+- `GET /health` → `{"status":"ok","version":"<x.y.z>","sessions":<count>}`
+- `POST /mcp` → Streamable HTTP MCP endpoint (stateful; session id returned in `Mcp-Session-Id` header)
+- `GET /mcp` → server-initiated SSE stream used by Claude Code for live `<channel>` notification push
+
+Client config for Claude Code:
 
 ```json
 {
   "mcpServers": {
     "agents": {
-      "command": "node",
-      "args": ["/home/you/.local/share/agents-mcp-server/build/index.js"],
-      "env": {
-        "AGENTS_NATS_URL": "nats://nats.example:4222"
-      }
+      "type": "http",
+      "url": "http://agents-mcp.<your-host>/mcp"
     }
   }
 }
 ```
 
-`AGENTS_NATS_URL` is **required** — the server is single-bus: DMs, channels, broadcasts, and presence all flow through NATS. Session push lights up on `agent_register`; before that the session is send-only and all traffic still lands in DuckDB for `*_history` reads.
+## Configuration reference
+
+| Env | Default | Notes |
+|---|---|---|
+| `AGENTS_NATS_URL` | _(no default)_ | Required; server refuses to start if NATS is unreachable |
+| `AGENTS_TRANSPORT` | `stdio` (code default; no default in the Docker image) | `stdio` or `http` |
+| `AGENTS_HTTP_PORT` | `3000` (code default) | HTTP mode only |
+| `AGENTS_HISTORY_MAX_AGE_MS` | `30d` | JetStream stream retention |
+| `AGENTS_HISTORY_MAX_BYTES` | `512 MiB` | JetStream stream cap |
+| `AGENTS_HISTORY_MAX_MSGS_PER_SUBJECT` | `10000` | Per-subject cap |
+| `AGENTS_LOG_FILE` | _unset_ | When set, writes a local audit log (stdio installs); unset in the default Docker image |
 
 ## `snd` CLI
 
@@ -85,27 +117,26 @@ snd <agent> <msg...>          DM to agent
 snd -t <agent> <msg...>       DM (explicit)
 snd -g <group> <msg...>       broadcast to group
 snd --human … <msg...>        prefix payload with [HUMAN] (wrapper does this for interactive use)
+snd --tail                    subscribe to every DM/broadcast/channel event on the bus (read-only)
 ```
 
-Only dependency is `AGENTS_NATS_URL`. One binary, one code path, callable from cron, shells, editor plugins.
+Only dependency is `AGENTS_NATS_URL`. `snd` talks NATS directly, so it works the same regardless of which MCP transport mode you're on.
 
 ## Real-time session push
 
-`agent_register` both joins the conversation and binds the session's identity. From that point on, in the same process:
+`agent_register` both joins the conversation and binds the session's identity. From that point on:
 
 - DMs where `to_agent == your name` arrive as `<channel source="agents" kind="dm" …>` tags.
 - Broadcasts where `group == your group` arrive as `<channel source="agents" kind="broadcast" …>` tags.
 - Channel posts arrive as `<channel source="agents" kind="channel" …>` tags.
 
-No second MCP process, no `comms_bind` call — the tools process and the channel source are the same binary. Echo suppression happens at the handler: you never see your own outbound message pushed back at you.
+In stdio mode the session is the process; in HTTP mode each connected client holds its own binding and SSE stream. Echo suppression happens at the handler: you never see your own outbound message pushed back at you.
 
-Sessions that haven't called `agent_register` yet stay send-only; inbound still lands in DuckDB for catch-up reads via `channel_history` / `dm_history` / `group_history`, so nothing is lost.
+Sessions that haven't called `agent_register` yet stay send-only; inbound is still captured by the JetStream audit stream and available via `channel_history` / `dm_history` / `group_history` for catch-up reads.
 
 ## Tools
 
-All tools use `name` for identification (agents know their names from prompts).
-
-Every response includes `_meta: { chars, lines, ms }` for token awareness.
+All tools use `name` for identification (agents know their names from prompts). Every response includes `_meta: { chars, lines, ms }` for token awareness.
 
 ### agent_register
 
@@ -113,12 +144,14 @@ Register as an agent. Returns peers in your group.
 
 ```typescript
 { name: "researcher", description: "Finds information", group?: "default" }
-// Returns: { agent_id: "researcher-a1b2", group: "default", peers: [...] }
+// Returns: { agent_id: "researcher-a1b2c3d4", group: "default", peers: [...] }
 ```
+
+`agent_id` is deterministic — `<name>-<sha256(name@host)[:8]>` — so it survives process restarts.
 
 ### agent_deregister
 
-Unregister when done. Idempotent - succeeds even if already gone.
+Unregister when done. Idempotent — succeeds even if already gone.
 
 ```typescript
 { name: "researcher" }
@@ -126,7 +159,7 @@ Unregister when done. Idempotent - succeeds even if already gone.
 
 ### agent_broadcast
 
-Send message to all other agents.
+Send a message to all other agents in a group.
 
 ```typescript
 { name: "researcher", message: "Found the data", priority?: "normal", group?: "all" }
@@ -134,7 +167,7 @@ Send message to all other agents.
 
 ### agent_dm
 
-Direct message to specific agent.
+Direct message to a specific agent.
 
 ```typescript
 { name: "researcher", to: "analyst", message: "Check this" }
@@ -142,7 +175,7 @@ Direct message to specific agent.
 
 ### agent_discover
 
-List active agents.
+List active agents (local + remote presence cache).
 
 ```typescript
 { include_stale?: false, group?: "research" }
@@ -158,7 +191,7 @@ List groups with agent counts.
 
 ### channel_send
 
-Post to a channel.
+Post to a channel (async bulletin board — no live nudge; use `agent_broadcast` / `agent_dm` for push).
 
 ```typescript
 { name: "researcher", channel: "general", message: "Update complete" }
@@ -166,17 +199,15 @@ Post to a channel.
 
 ### channel_history
 
-Get channel messages. Use `detailed: true` for full metadata.
+Get channel messages. `detailed: true` returns full metadata.
 
 ```typescript
 { channel: "general", limit?: 50, detailed?: false }
-// detailed=false: "[12:30:45] researcher: message"
-// detailed=true: { channel, count, messages: [{ id, timestamp, from, content }] }
 ```
 
 ### dm_history
 
-Get DM history. Use `detailed: true` for full metadata.
+Get DM history between two agents.
 
 ```typescript
 { name: "researcher", with_agent: "analyst", limit?: 50, detailed?: false }
@@ -190,88 +221,78 @@ List channels with message counts.
 {}
 ```
 
+### group_history
+
+Get recent broadcasts for a group.
+
+```typescript
+{ group: "research", limit?: 50 }
+```
+
 ### messages_since
 
-Poll for new messages (for TUI).
+Poll for new messages since a given JetStream sequence.
 
 ```typescript
 { since_id?: 0, limit?: 100 }
 ```
 
-### tool_metrics
+### poll_messages
 
-Analyze tool usage over time.
+Poll DMs + broadcasts addressed to a given agent since last check.
 
 ```typescript
-{ days?: 7 }
-// Returns: tool_name, call_count, avg_chars, total_chars, error_count
+{ name: "researcher", since_id?: 0 }
 ```
 
 ## How It Works
 
-Single bus: everything (presence, DMs, broadcasts, channel posts) flows through NATS on `AGENTS_NATS_URL`. Local DuckDB is a per-host cache for history reads, not a delivery plane.
+One bus, one audit store. Presence, DMs, broadcasts, and channel posts all flow through NATS on `AGENTS_NATS_URL`. A single JetStream stream (`agents-history`) captures every DM/channel/broadcast subject for history reads.
 
-### State & persistence
+### State
 
-1. `agent_register` inserts a row in DuckDB; that row is the binding between agent name and the current session.
-2. Every outbound `agent_broadcast` / `agent_dm` / `channel_send` writes to the local DuckDB so `*_history` tools keep working offline.
-3. Inbound messages from other hosts are mirrored into the local DuckDB on receive (same-host echoes skip the write — the publisher already stored the row).
-4. `tool_metrics` reports per-tool usage from that same DuckDB.
+- **Agent registry** — in-memory `Map` of local agents; remote peers served from the NATS presence cache (10s beat, 30s TTL). No on-disk state, no DuckDB.
+- **Message history** — JetStream stream `agents-history` with subject filter `agents.dm.>`, `agents.channel.>`, `agents.broadcast.>`. Retention: 30d / 512 MiB / 10 000 msgs per subject (env-tunable). Every `*_history` tool opens an ephemeral JetStream consumer with a subject filter, drains up to `limit`, deletes the consumer.
 
-### NATS transport (delivery plane)
+### NATS subjects
 
-When the server starts with `AGENTS_NATS_URL`, four subjects light up:
+- `agents.presence` — presence beats (not retained in the stream)
+- `agents.dm.<base64url(to_agent)>` — direct messages
+- `agents.channel.<base64url(channel_name)>` — channel posts
+- `agents.broadcast.<base64url(group)>` — group broadcasts
 
-- **Presence** — every registered agent publishes a beat on `agents.presence` every 10s, TTL 30s. `agent_discover` merges remote peers from the cache.
-- **Channel posts** — `channel_send` publishes to `agents.channel.<base64url(name)>`. All hosts subscribe and replicate into their local DuckDB so `channel_history` sees cross-host traffic.
-- **DMs** — `agent_dm` publishes to `agents.dm.<base64url(to_agent)>`. Delivery is uniform: same-host and cross-host take the same path.
-- **Broadcasts** — `agent_broadcast` publishes to `agents.broadcast.<base64url(group)>`. Group-bound sessions receive as `<channel kind="broadcast">`.
-
-Sessions bound via `agent_register` get DMs and broadcasts pushed straight into the transcript as `<channel>` tags — no polling. The publisher's own messages are filtered at the handler so you don't see yourself echoed back.
-
-### Channels source (real-time session push)
-
-`build/channel.js` is a separate stdio MCP, spawned per session via `claude --dangerously-load-development-channels server:agents-channel`. It declares the experimental `claude/channel` capability and subscribes to `agents.channel.*`. On every remote message it emits a `notifications/claude/channel` event with `{content, meta}` — Claude Code renders that as `<channel source="agents-channel" channel="…" from_agent="…" origin_host="…" origin_ts="…">body</channel>` in the live transcript. No polling, no `snd`, sub-second round-trip.
-
-### End-to-end trace
+### End-to-end trace (channel post)
 
 ```
-bob channel_send("#eng", …)         [pop-os]
-   │
-   ├──► pop-os DuckDB   (local history row)
+bob channel_send("#eng", "hi")
    │
    └──► NATS publish agents.channel.<b64url(#eng)>
                           │
            ┌──────────────┴──────────────┐
            ▼                             ▼
-  agents-mcp-server (tools)     agents-channel (source)
-  on serval                      on serval
-       │                              │
-       ▼                              ▼
-  serval DuckDB row        notifications/claude/channel
-  (channel_history reads           │
-   here)                           ▼
-                      <channel …>body</channel> in
-                      john-dev's session, live
+  JetStream stream              agents-mcp-server sessions
+  agents-history                bound to other agents
+       │                               │
+       ▼                               ▼
+  channel_history reads    notifications/claude/channel →
+  return this seq later    <channel source="agents" kind="channel" …>
+                           rendered live in the bound session
 ```
+
+### Sub-second session push
+
+When Claude Code is launched with `--dangerously-load-development-channels server:agents`, the same subprocess handles both tool calls and the experimental `claude/channel` capability — no separate channel binary. Each NATS subscription fan-ins into every bound session whose binding matches the target. Publishers never see their own messages pushed back.
 
 ## Token Efficiency
 
 Every response includes `_meta`:
-```
-Active agents (2):
-- alice: active | group: default
-- bob: active | group: default
----
-_meta: {"chars":95,"lines":3,"ms":12}
-```
 
-After a week, analyze with `tool_metrics(days: 7)`:
 ```
-Tool metrics (last 7 days):
-- agent_broadcast: 50 calls, avg 68 chars, total 3400 chars
-- agent_discover: 20 calls, avg 150 chars, total 3000 chars
-Total: 70 calls, 6400 chars (~1600 tokens)
+Active agents (2) in group 'default':
+- alice (alice-7c3f9a81): active | group: default | host: serval | local
+- bob (bob-f600ddba):   active | group: default | host: agents-mcp-pod | remote
+---
+_meta: {"chars":170,"lines":3,"ms":8}
 ```
 
 ## Development
@@ -280,6 +301,14 @@ Total: 70 calls, 6400 chars (~1600 tokens)
 npm install
 npm run build
 npm test
+```
+
+Docker image:
+
+```bash
+docker build -t agents-mcp-server:dev .
+docker run --rm -e AGENTS_NATS_URL=nats://host.docker.internal:4222 -p 3000:3000 agents-mcp-server:dev
+curl http://localhost:3000/health
 ```
 
 ## License
