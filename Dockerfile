@@ -6,9 +6,11 @@
 FROM node:22-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json tsconfig.json ./
-RUN npm ci --no-audit --no-fund
+# --ignore-scripts skips the prepare:tsc hook, which would fail here since
+# src/ isn't copied yet. We run tsc explicitly once src lands.
+RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY src ./src
-RUN npx tsc && npm prune --omit=dev
+RUN npx tsc && npm prune --omit=dev --ignore-scripts
 
 FROM node:22-alpine
 WORKDIR /app
