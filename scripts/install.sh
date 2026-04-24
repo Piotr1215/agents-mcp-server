@@ -25,7 +25,7 @@ main() {
     esac
   done
 
-  require_cmd git node npm duckdb jq
+  require_cmd git node npm jq
 
   local node_major
   node_major=$(node -p 'process.versions.node.split(".")[0]')
@@ -110,7 +110,7 @@ Environment:
   AGENTS_MCP_BRANCH  override branch (default: main)
 
 Prereqs:
-  git, node >= 18, npm, duckdb, jq
+  git, node >= 18, npm, jq
 EOF
 }
 

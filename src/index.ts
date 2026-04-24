@@ -1,19 +1,31 @@
 #!/usr/bin/env node
-// PROJECT: claude-automation, agent-lifecycle
-// Issue: https://github.com/Piotr1215/claude/issues/42
-// Agent communication over NATS. Single MCP process exposes tools AND acts as
-// a Claude Code Channels source — agent_register binds the session's identity
-// implicitly, so DMs and group broadcasts push in as <channel> tags with no
-// second call. When the session is launched with
-// `claude --dangerously-load-development-channels server:agents`, Claude Code
-// treats this same subprocess as the channel source and routes its
-// notifications/claude/channel events into the live transcript.
+// PROJECT: claude-automation, agent-lifecycle, agents-mcp-homelab-deploy
+// Issue: https://github.com/Piotr1215/claude/issues/42 (lineage), #129 (DuckDB drop)
+//
+// Agent communication over NATS. Two modes, picked at boot via AGENTS_TRANSPORT:
+//
+//   stdio (default) — one MCP process per user, spawned by Claude Code.
+//                     `agent_register` binds the process's identity.
+//
+//   http            — single shared process fronted by streamable HTTP. Each
+//                     engineer's Claude Code negotiates its own session; each
+//                     session holds its own binding, its own McpServer, and
+//                     its own connected NATS-driven notification fan-in. Used
+//                     by the homelab + loft.rocks deployments.
+//
+// All persistence lives on NATS: presence on `agents.presence`, and the
+// `agents-history` JetStream stream captures every DM/channel/broadcast for
+// history reads (#123 Phase 1 — JetStream-only audit store). No DuckDB.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { randomBytes } from "crypto";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { randomUUID } from "crypto";
+import { createServer, IncomingMessage, ServerResponse } from "http";
 import { z } from "zod";
 import { appendFileSync } from "fs";
-import * as db from "./db.js";
+import * as registry from "./registry.js";
+import * as history from "./history.js";
 import { initNatsTransport, NatsTransport } from "./nats.js";
 import {
   buildChannelNotification,
@@ -28,380 +40,283 @@ import {
   broadcastGroupIsReachable,
 } from "./validation.js";
 
-const LOG_FILE = "/tmp/agent_messages.log";
+const SERVER_NAME = "agents";
+const SERVER_VERSION = "5.0.0";
+const DEFAULT_NATS_URL = "nats://nats.nats.svc:4222";
+const LOG_FILE = process.env.AGENTS_LOG_FILE || "";
 
 let natsTransport: NatsTransport | null = null;
 
-// In-process identity binding set by agent_register, consumed by the
-// channel-notification emitters. When unset, DMs and broadcasts still flow
-// to DuckDB (so *_history works) but are not pushed into the session — the
-// session is send-only until someone calls agent_register.
-let sessionBinding: { name: string; group: string; agentId: string } | null = null;
+interface SessionBinding { name: string; group: string; agentId: string; }
+
+interface Session {
+  id: string;
+  server: McpServer;
+  transport: StdioServerTransport | StreamableHTTPServerTransport;
+  getBinding: () => SessionBinding | null;
+  setBinding: (b: SessionBinding | null) => void;
+}
+
+const sessions = new Map<string, Session>();
 
 function logToFile(type: string, content: string): void {
-  const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
-  appendFileSync(LOG_FILE, `[${ts}] [${type}] ${content}\n`);
+  if (!LOG_FILE) return;
+  try {
+    const ts = new Date().toLocaleTimeString("en-GB", { hour12: false });
+    appendFileSync(LOG_FILE, `[${ts}] [${type}] ${content}\n`);
+  } catch { /* best-effort */ }
 }
 
-function generateAgentId(name: string): string {
-  const suffix = randomBytes(4).toString("hex");
-  return `${name}-${suffix}`;
-}
-
-// Metrics wrapper for tool handlers
-async function withMetrics<T>(
-  toolName: string,
-  fn: () => Promise<string>
+// Wrap a handler so every response carries `_meta` with chars/lines/ms. The
+// old implementation also wrote per-call rows to DuckDB's tool_metrics; that
+// telemetry store is gone with #129. If anyone wants per-tool metrics again,
+// they'll land on a dedicated JetStream subject, not a relational store.
+async function withMeta(
+  fn: () => Promise<string>,
 ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
   const startTime = Date.now();
-  try {
-    const result = await fn();
-    const durationMs = Date.now() - startTime;
-    const responseChars = result.length;
-    const responseLines = result.split("\n").length;
-    await db.logToolMetric(toolName, responseChars, responseLines, durationMs, false);
-
-    const meta = { _meta: { chars: responseChars, lines: responseLines, ms: durationMs } };
-    const finalResult = result.startsWith("{")
-      ? JSON.stringify({ ...JSON.parse(result), ...meta })
-      : `${result}\n---\n_meta: ${JSON.stringify(meta._meta)}`;
-
-    return { content: [{ type: "text", text: finalResult }] };
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    const durationMs = Date.now() - startTime;
-    await db.logToolMetric(toolName, msg.length, 1, durationMs, true);
-    throw error;
-  }
+  const result = await fn();
+  const durationMs = Date.now() - startTime;
+  const responseChars = result.length;
+  const responseLines = result.split("\n").length;
+  const meta = { chars: responseChars, lines: responseLines, ms: durationMs };
+  const finalResult = result.startsWith("{")
+    ? JSON.stringify({ ...JSON.parse(result), _meta: meta })
+    : `${result}\n---\n_meta: ${JSON.stringify(meta)}`;
+  return { content: [{ type: "text", text: finalResult }] };
 }
 
-// Create server. Declares the Claude Code Channels capability alongside
-// tools: when the session is launched with
-// `claude --dangerously-load-development-channels server:agents`, this same
-// subprocess is the channel source. No separate comms server needed.
-const server = new McpServer(
-  { name: "agents", version: "4.0.0" },
-  {
-    capabilities: {
-      tools: {},
-      experimental: { "claude/channel": {} },
+function createMcpServer(session: { getBinding: () => SessionBinding | null; setBinding: (b: SessionBinding | null) => void }): McpServer {
+  const server = new McpServer(
+    { name: SERVER_NAME, version: SERVER_VERSION },
+    {
+      capabilities: {
+        tools: {},
+        experimental: { "claude/channel": {} },
+      },
+      instructions: "Multi-agent coordination server with live session push. agent_register(name, description, group) both joins and binds this session — from that moment on, DMs to this name and broadcasts to this group push in as <channel source=\"agents\" kind=\"dm|broadcast|channel\">body</channel> tags. Use agent_broadcast, agent_dm, channel_send for outbound. Use *_history tools for catch-up reads. Deregister on shutdown.",
     },
-    instructions: "Multi-agent coordination server with live session push. agent_register(name, description, group) both joins and binds this session — from that moment on, DMs to this name and broadcasts to this group push in as <channel source=\"agents\" kind=\"dm|broadcast|channel\">body</channel> tags. Use agent_broadcast, agent_dm, channel_send for outbound. Use *_history tools for catch-up reads. Deregister on shutdown.",
-  }
-);
+  );
 
-// Tool: agent_register
-server.registerTool(
-  "agent_register",
-  {
-    title: "Join Conversation",
-    description: "Register as an agent. Returns agent_id and list of active peers in your group.",
-    inputSchema: {
-      name: z.string().describe("Agent name"),
-      description: z.string().describe("What this agent does"),
-      group: z.string().optional().default("default").describe("Agent group (default: 'default')"),
+  server.registerTool(
+    "agent_register",
+    {
+      title: "Join Conversation",
+      description: "Register as an agent. Returns agent_id and list of active peers in your group.",
+      inputSchema: {
+        name: z.string().describe("Agent name"),
+        description: z.string().describe("What this agent does"),
+        group: z.string().optional().default("default").describe("Agent group (default: 'default')"),
+      },
+      annotations: { readOnlyHint: false },
     },
-    annotations: { readOnlyHint: false },
-  },
-  async ({ name, description, group }) => {
-    return withMetrics("agent_register", async () => {
+    async ({ name, group }) => withMeta(async () => {
       const groupName = group || "default";
-      const existing = await db.getAgentByName(name);
-      const agentId = existing?.id || generateAgentId(name);
+      const host = natsTransport?.getHost() ?? "local";
+      const agentId = registry.generateAgentId(name, host);
+      registry.registerAgent(agentId, name, groupName);
 
-      await db.registerAgent(agentId, name, groupName);
+      const peers = registry
+        .getAgents(groupName)
+        .filter((a) => a.name !== name)
+        .map((a) => ({ name: a.name, group: a.group_name }));
 
-      const allAgents = await db.getAgents(groupName);
-      const peers: Array<{ name: string; group: string; host?: string }> = allAgents
-        .filter(a => a && a.name && a.name !== name)
-        .map(a => ({ name: a.name, group: a.group_name }));
-
-      // Implicitly bind this session's identity. No separate comms_bind tool:
-      // one agent per session, set at register time. From now on, DMs to this
-      // name and broadcasts to this group will push into the session as
-      // <channel> tags.
-      sessionBinding = { name, group: groupName, agentId };
+      session.setBinding({ name, group: groupName, agentId });
 
       if (natsTransport) {
         const localAgent = { agent_id: agentId, name, group: groupName };
         natsTransport.trackLocal(localAgent);
         await natsTransport.publishBeat(localAgent);
-        for (const beat of natsTransport.getRemotePeers(groupName)) {
-          peers.push({ name: beat.name, group: beat.group, host: beat.host });
-        }
       }
 
       return JSON.stringify({
         agent_id: agentId,
         group: groupName,
         peers,
-        message: "Registered. Use your name for subsequent calls."
+        message: "Registered. Use your name for subsequent calls.",
       });
-    });
-  }
-);
+    }),
+  );
 
-// Tool: agent_deregister
-server.registerTool(
-  "agent_deregister",
-  {
-    title: "Leave Conversation",
-    description: "Deregister an agent when shutting down.",
-    inputSchema: {
-      name: z.string().describe("Your agent name"),
+  server.registerTool(
+    "agent_deregister",
+    {
+      title: "Leave Conversation",
+      description: "Deregister an agent when shutting down.",
+      inputSchema: { name: z.string().describe("Your agent name") },
+      annotations: { destructiveHint: true },
     },
-    annotations: { destructiveHint: true },
-  },
-  async ({ name }) => {
-    return withMetrics("agent_deregister", async () => {
-      const agent = await db.getAgentByName(name);
-      if (!agent || !agent.id) {
-        return JSON.stringify({
-          success: true,
-          name,
-          message: "was already gone or never registered"
-        });
+    async ({ name }) => withMeta(async () => {
+      const agent = registry.getAgentByName(name);
+      if (!agent) {
+        return JSON.stringify({ success: true, name, message: "was already gone or never registered" });
       }
-      const agentInfo = {
-        id: agent.id,
-        name: agent.name,
-        group_name: agent.group_name || "default",
-      };
-      await db.deregisterAgent(agent.id);
-      await db.logMessage("LEFT", agent.id, null, agent.group_name || "default", `${agent.name} left`);
+      registry.deregisterAgent(agent.id);
       if (natsTransport) natsTransport.untrackLocal(agent.id);
-      if (sessionBinding && sessionBinding.agentId === agent.id) {
-        sessionBinding = null;
-      }
+      const binding = session.getBinding();
+      if (binding && binding.agentId === agent.id) session.setBinding(null);
       return JSON.stringify({
         success: true,
-        ...agentInfo,
-        message: `Deregistered ${name}`
+        id: agent.id,
+        name: agent.name,
+        group_name: agent.group_name,
+        message: `Deregistered ${name}`,
       });
-    });
-  }
-);
+    }),
+  );
 
-// Tool: agent_broadcast
-server.registerTool(
-  "agent_broadcast",
-  {
-    title: "Broadcast Message",
-    description: "Send a message to ALL other agents.",
-    inputSchema: {
-      name: z.string().describe("Your agent name"),
-      message: z.string().describe("Message content"),
-      priority: z.enum(["low", "normal", "high"]).optional().default("normal").describe("Message priority"),
-      group: z.string().optional().describe("Target group (omit for all agents)"),
+  server.registerTool(
+    "agent_broadcast",
+    {
+      title: "Broadcast Message",
+      description: "Send a message to ALL other agents.",
+      inputSchema: {
+        name: z.string().describe("Your agent name"),
+        message: z.string().describe("Message content"),
+        priority: z.enum(["low", "normal", "high"]).optional().default("normal").describe("Message priority"),
+        group: z.string().optional().describe("Target group (omit for all agents)"),
+      },
+      annotations: { readOnlyHint: false },
     },
-    annotations: { readOnlyHint: false },
-  },
-  async ({ name, message, priority, group }) => {
-    return withMetrics("agent_broadcast", async () => {
-      const sender = await db.getAgentByName(name);
-      if (!sender || !sender.id) {
-        return `Error: You (${name}) not registered. Call agent_register first.`;
-      }
-
+    async ({ name, message, group }) => withMeta(async () => {
+      const sender = registry.getAgentByName(name);
+      if (!sender) return `Error: You (${name}) not registered. Call agent_register first.`;
       const bodyErr = validateMessageBody(message);
       if (bodyErr) return `Error: broadcast ${bodyErr}.`;
+      if (!natsTransport) return `Error: NATS transport not configured — broadcasts require AGENTS_NATS_URL.`;
 
-      if (!natsTransport) {
-        return `Error: NATS transport not configured — broadcasts require AGENTS_NATS_URL.`;
-      }
+      const targetGroup = group === "all" ? null : (group || sender.group_name);
+      if (!targetGroup) return `Error: broadcast requires a target group.`;
 
-      const senderGroup = sender.group_name || "default";
-      const targetGroup = group === "all" ? null : (group || senderGroup);
-      if (!targetGroup) {
-        return `Error: broadcast requires a target group (or group="all" is not yet wired for wildcard publish).`;
-      }
-
-      // Reject broadcasts to groups with zero registered agents (local + remote).
-      // Catches typos like `-g nonexistent-group`; does not reject when the
-      // sender is the only member in their own group (valid "group of one").
       const groupReachable = await broadcastGroupIsReachable(targetGroup, {
-        localMemberCount: async (g) => (await db.getAgents(g)).length,
+        localMemberCount: (g) => registry.getAgents(g).length,
         remoteMemberCount: (g) => natsTransport!.getRemotePeers(g).length,
       });
-      if (!groupReachable) {
-        return `Error: group '${targetGroup}' has no registered agents. Use agent_groups to see active groups.`;
-      }
+      if (!groupReachable) return `Error: group '${targetGroup}' has no registered agents. Use agent_groups to see active groups.`;
 
-      await db.logMessage("BROADCAST", sender.id, null, targetGroup, message, natsTransport.getHost());
       logToFile("BROADCAST", `${name} -> ${targetGroup}: ${message}`);
-
       natsTransport.publishBroadcast(targetGroup, name, message);
       return `Broadcast published to group '${targetGroup}' over NATS. Sessions bound to that group receive it as <channel kind="broadcast">.`;
-    });
-  }
-);
+    }),
+  );
 
-// Tool: agent_dm
-server.registerTool(
-  "agent_dm",
-  {
-    title: "Direct Message",
-    description: "Send a direct message to a specific agent.",
-    inputSchema: {
-      name: z.string().describe("Your agent name"),
-      to: z.string().describe("Target agent name"),
-      message: z.string().describe("Message content"),
+  server.registerTool(
+    "agent_dm",
+    {
+      title: "Direct Message",
+      description: "Send a direct message to a specific agent.",
+      inputSchema: {
+        name: z.string().describe("Your agent name"),
+        to: z.string().describe("Target agent name"),
+        message: z.string().describe("Message content"),
+      },
+      annotations: { readOnlyHint: false },
     },
-    annotations: { readOnlyHint: false },
-  },
-  async ({ name, to, message }) => {
-    return withMetrics("agent_dm", async () => {
-      const sender = await db.getAgentByName(name);
-      if (!sender || !sender.id) {
-        return `Error: You (${name}) not registered. Call agent_register first.`;
-      }
-      if (!natsTransport) {
-        return `Error: NATS transport not configured — DMs require AGENTS_NATS_URL.`;
-      }
+    async ({ name, to, message }) => withMeta(async () => {
+      const sender = registry.getAgentByName(name);
+      if (!sender) return `Error: You (${name}) not registered. Call agent_register first.`;
+      if (!natsTransport) return `Error: NATS transport not configured — DMs require AGENTS_NATS_URL.`;
 
       const bodyErr = validateMessageBody(message);
       if (bodyErr) return `Error: DM ${bodyErr}.`;
-
       const selfErr = validateDmTarget(name, to);
       if (selfErr) return `Error: ${selfErr}.`;
 
-      // Ghost-target rejection: look up target locally, then in the NATS
-      // presence cache (30s TTL). A just-deregistered target can still slip
-      // through — acceptable, matches the system's existing eventual-consistency
-      // model. Purpose is catching typos and stale names, not strict correctness.
-      const target = await db.getAgentByName(to);
       const reachable = await dmTargetIsReachable(to, {
-        hasLocalAgent: () => !!target,
+        hasLocalAgent: () => !!registry.getAgentByName(to),
         hasRemotePeer: (n) => natsTransport!.getRemotePeers().some((p) => p.name === n),
       });
-      if (!reachable) {
-        return `Error: agent '${to}' not registered. Use agent_discover to see active agents.`;
-      }
+      if (!reachable) return `Error: agent '${to}' not registered. Use agent_discover to see active agents.`;
 
-      const targetId = target?.id || to;
-      await db.logMessage("DM", sender.id, targetId, null, message, natsTransport.getHost());
       logToFile("DM", `${name} -> ${to}: ${message}`);
-
       natsTransport.publishDirectMessage(to, name, message);
-      return `DM published to '${to}' over NATS. Live delivery happens when the recipient session is registered; otherwise the message stays in dm_history for catch-up.`;
-    });
-  }
-);
+      return `DM published to '${to}' over NATS. Live delivery happens when the recipient session is registered (agent_register auto-binds); otherwise the message stays in dm_history for catch-up.`;
+    }),
+  );
 
-// Tool: agent_discover
-server.registerTool(
-  "agent_discover",
-  {
-    title: "Find Peers",
-    description: "Discover all active agents.",
-    inputSchema: {
-      include_stale: z.boolean().optional().default(false).describe("Include agents not seen in last 5 minutes"),
-      group: z.string().optional().describe("Filter by group (omit for all)"),
+  server.registerTool(
+    "agent_discover",
+    {
+      title: "Find Peers",
+      description: "Discover all active agents.",
+      inputSchema: {
+        include_stale: z.boolean().optional().default(false).describe("Include agents not seen in last 5 minutes"),
+        group: z.string().optional().describe("Filter by group (omit for all)"),
+      },
+      annotations: { readOnlyHint: true },
     },
-    annotations: { readOnlyHint: true },
-  },
-  async ({ include_stale, group }) => {
-    return withMetrics("agent_discover", async () => {
-      const agents = await db.getAgents(group || undefined);
-      const validAgents = agents.filter(a => a && a.id && a.name);
-      const remotePeers = natsTransport ? natsTransport.getRemotePeers(group || undefined) : [];
-
-      if (validAgents.length === 0 && remotePeers.length === 0) {
+    async ({ group }) => withMeta(async () => {
+      const agents = registry.getAgents(group || undefined);
+      if (agents.length === 0) {
         return group ? `No agents in group '${group}'` : "No agents currently registered.";
       }
-
       const localHost = natsTransport ? natsTransport.getHost() : "local";
-      const localLines = validAgents.map(a =>
-        `- ${a.name} (${a.id}): active | group: ${a.group_name || "default"} | host: ${localHost} | local`
-      );
-      const remoteLines = remotePeers.map(p =>
-        `- ${p.name} (${p.agent_id}): active | group: ${p.group} | host: ${p.host} | remote`
-      );
-
-      const lines = [...localLines, ...remoteLines];
+      const lines = agents.map((a) => {
+        const isLocal = !!registry.getAgent(a.id);
+        const host = isLocal ? localHost : "remote";
+        return `- ${a.name} (${a.id}): active | group: ${a.group_name} | host: ${host}${isLocal ? " | local" : ""}`;
+      });
       const groupInfo = group ? ` in group '${group}'` : "";
       return `Active agents (${lines.length})${groupInfo}:\n${lines.join("\n")}`;
-    });
-  }
-);
+    }),
+  );
 
-// Tool: agent_groups
-server.registerTool(
-  "agent_groups",
-  {
-    title: "List Groups",
-    description: "List all active agent groups.",
-    inputSchema: {},
-    annotations: { readOnlyHint: true },
-  },
-  async () => {
-    return withMetrics("agent_groups", async () => {
-      const groups = await db.getGroups();
-
+  server.registerTool(
+    "agent_groups",
+    {
+      title: "List Groups",
+      description: "List all active agent groups.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true },
+    },
+    async () => withMeta(async () => {
+      const groups = registry.getGroups();
       if (groups.length === 0) return "No agents registered.";
-
-      const lines = groups.map(g => `- ${g.group_name} (${g.count} agent${g.count > 1 ? "s" : ""})`);
+      const lines = groups.map((g) => `- ${g.group_name} (${g.count} agent${g.count > 1 ? "s" : ""})`);
       return `Active groups (${groups.length}):\n${lines.join("\n")}`;
-    });
-  }
-);
+    }),
+  );
 
-// Tool: channel_send
-// Channels are async bulletin boards — log to DB only, no tmux nudge.
-// Use agent_dm or agent_broadcast when you need real-time delivery.
-server.registerTool(
-  "channel_send",
-  {
-    title: "Post to Channel",
-    description: "Log a message to a channel (async bulletin board). Does NOT nudge agents — use agent_dm or agent_broadcast for real-time delivery. Agents read channels via channel_history.",
-    inputSchema: {
-      name: z.string().describe("Your agent name"),
-      channel: z.string().describe("Channel name"),
-      message: z.string().describe("Message content"),
+  server.registerTool(
+    "channel_send",
+    {
+      title: "Post to Channel",
+      description: "Log a message to a channel (async bulletin board). Does NOT nudge agents — use agent_dm or agent_broadcast for real-time delivery. Agents read channels via channel_history.",
+      inputSchema: {
+        name: z.string().describe("Your agent name"),
+        channel: z.string().describe("Channel name"),
+        message: z.string().describe("Message content"),
+      },
+      annotations: { readOnlyHint: false },
     },
-    annotations: { readOnlyHint: false },
-  },
-  async ({ name, channel, message }) => {
-    return withMetrics("channel_send", async () => {
-      const sender = await db.getAgentByName(name);
-      const senderId = sender?.id || name;
-
-      await db.logMessage("CHANNEL", senderId, null, channel, message, natsTransport?.getHost() ?? null);
+    async ({ name, channel, message }) => withMeta(async () => {
+      if (!natsTransport) return `Error: NATS transport not configured — channels require AGENTS_NATS_URL.`;
       logToFile("CHANNEL", `#${channel} ${name}: ${message}`);
-
-      if (natsTransport) natsTransport.publishChannelMessage(channel, senderId, message);
-
+      natsTransport.publishChannelMessage(channel, name, message);
       return `Message logged to #${channel}`;
-    });
-  }
-);
+    }),
+  );
 
-// Tool: channel_history
-server.registerTool(
-  "channel_history",
-  {
-    title: "Read Channel",
-    description: "Get recent messages from a channel.",
-    inputSchema: {
-      channel: z.string().describe("Channel name"),
-      limit: z.number().optional().default(50).describe("Max messages to return (default: 50)"),
-      detailed: z.boolean().optional().default(false).describe("Include full metadata (default: false, compact mode)"),
+  server.registerTool(
+    "channel_history",
+    {
+      title: "Read Channel",
+      description: "Get recent messages from a channel.",
+      inputSchema: {
+        channel: z.string().describe("Channel name"),
+        limit: z.number().optional().default(50).describe("Max messages to return (default: 50)"),
+        detailed: z.boolean().optional().default(false).describe("Include full metadata (default: false, compact mode)"),
+      },
+      annotations: { readOnlyHint: true },
     },
-    annotations: { readOnlyHint: true },
-  },
-  async ({ channel, limit, detailed }) => {
-    return withMetrics("channel_history", async () => {
-      const messages = await db.getChannelHistory(channel, limit);
-
+    async ({ channel, limit, detailed }) => withMeta(async () => {
+      const messages = await history.getChannelHistory(channel, limit);
       if (messages.length === 0) return `No messages in #${channel}`;
-
-      const validMessages = messages.filter(m => m && m.id);
-
       if (detailed) {
         return JSON.stringify({
           channel,
-          count: validMessages.length,
-          messages: validMessages.reverse().map(m => ({
+          count: messages.length,
+          messages: messages.map((m) => ({
             id: m.id,
             timestamp: m.timestamp,
             from: m.from_agent,
@@ -409,51 +324,36 @@ server.registerTool(
           })),
         });
       }
-
-      const lines = validMessages.reverse().map(m => {
+      const lines = messages.map((m) => {
         const ts = new Date(m.timestamp).toLocaleTimeString();
         const from = m.from_agent?.split("-")[0] || "unknown";
         return `[${ts}] ${from}: ${m.content}`;
       });
-
       return `#${channel} history (${messages.length}):\n${lines.join("\n")}`;
-    });
-  }
-);
+    }),
+  );
 
-// Tool: dm_history
-server.registerTool(
-  "dm_history",
-  {
-    title: "Catch Up on DMs",
-    description: "Get DM history between you and another agent.",
-    inputSchema: {
-      name: z.string().describe("Your agent name"),
-      with_agent: z.string().describe("The other agent's name"),
-      limit: z.number().optional().default(50).describe("Max messages to return (default: 50)"),
-      detailed: z.boolean().optional().default(false).describe("Include full metadata (default: false, compact mode)"),
+  server.registerTool(
+    "dm_history",
+    {
+      title: "Catch Up on DMs",
+      description: "Get DM history between you and another agent.",
+      inputSchema: {
+        name: z.string().describe("Your agent name"),
+        with_agent: z.string().describe("The other agent's name"),
+        limit: z.number().optional().default(50).describe("Max messages to return (default: 50)"),
+        detailed: z.boolean().optional().default(false).describe("Include full metadata (default: false, compact mode)"),
+      },
+      annotations: { readOnlyHint: true },
     },
-    annotations: { readOnlyHint: true },
-  },
-  async ({ name, with_agent, limit, detailed }) => {
-    return withMetrics("dm_history", async () => {
-      const myAgent = await db.getAgentByName(name);
-      const otherAgent = await db.getAgentByName(with_agent);
-
-      const myId = myAgent?.id || name;
-      const otherId = otherAgent?.id || with_agent;
-      const otherName = otherAgent?.name || with_agent;
-
-      const messages = await db.getDmHistory(myId, otherId, limit);
-      const validMessages = messages.filter(m => m && m.id);
-
-      if (validMessages.length === 0) return `No DM history with ${otherName}`;
-
+    async ({ name, with_agent, limit, detailed }) => withMeta(async () => {
+      const messages = await history.getDmHistory(name, with_agent, limit);
+      if (messages.length === 0) return `No DM history with ${with_agent}`;
       if (detailed) {
         return JSON.stringify({
-          with_agent: otherName,
-          count: validMessages.length,
-          messages: validMessages.reverse().map(m => ({
+          with_agent,
+          count: messages.length,
+          messages: messages.map((m) => ({
             id: m.id,
             timestamp: m.timestamp,
             from: m.from_agent,
@@ -462,252 +362,305 @@ server.registerTool(
           })),
         });
       }
-
-      const lines = validMessages.reverse().map(m => {
+      const lines = messages.map((m) => {
         const ts = new Date(m.timestamp).toLocaleTimeString();
         const from = m.from_agent?.split("-")[0] || "unknown";
         return `[${ts}] ${from}: ${m.content}`;
       });
+      return `DM history with ${with_agent} (${messages.length}):\n${lines.join("\n")}`;
+    }),
+  );
 
-      return `DM history with ${otherName} (${validMessages.length}):\n${lines.join("\n")}`;
-    });
-  }
-);
-
-// Tool: channel_list
-server.registerTool(
-  "channel_list",
-  {
-    title: "List Channels",
-    description: "List all channels with message counts.",
-    inputSchema: {},
-    annotations: { readOnlyHint: true },
-  },
-  async () => {
-    return withMetrics("channel_list", async () => {
-      const channels = await db.getChannels();
-
-      if (channels.length === 0) return "No channels with messages yet.";
-
-      const lines = channels.map(c => `- #${c.channel} (${c.message_count} messages)`);
-      return `Active channels (${channels.length}):\n${lines.join("\n")}`;
-    });
-  }
-);
-
-// Tool: group_history
-server.registerTool(
-  "group_history",
-  {
-    title: "Read Group History",
-    description: "Get recent broadcast and system messages for a group.",
-    inputSchema: {
-      group: z.string().describe("Group name"),
-      limit: z.number().optional().default(50).describe("Max messages to return (default: 50)"),
+  server.registerTool(
+    "channel_list",
+    {
+      title: "List Channels",
+      description: "List all channels with message counts.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true },
     },
-    annotations: { readOnlyHint: true },
-  },
-  async ({ group, limit }) => {
-    return withMetrics("group_history", async () => {
-      const messages = await db.getGroupHistory(group, limit);
+    async () => withMeta(async () => {
+      const channels = await history.getChannels();
+      if (channels.length === 0) return "No channels with messages yet.";
+      const lines = channels.map((c) => `- #${c.channel} (${c.message_count} messages)`);
+      return `Active channels (${channels.length}):\n${lines.join("\n")}`;
+    }),
+  );
 
+  server.registerTool(
+    "group_history",
+    {
+      title: "Read Group History",
+      description: "Get recent broadcast messages for a group.",
+      inputSchema: {
+        group: z.string().describe("Group name"),
+        limit: z.number().optional().default(50).describe("Max messages to return (default: 50)"),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ group, limit }) => withMeta(async () => {
+      const messages = await history.getGroupHistory(group, limit);
       if (messages.length === 0) return `No history for group '${group}'`;
-
-      const validMessages = messages.filter(m => m && m.id);
-
-      const lines = validMessages.reverse().map(m => {
+      const lines = messages.map((m) => {
         const ts = new Date(m.timestamp).toLocaleTimeString();
         const from = m.from_agent?.split("-")[0] || "system";
-        const prefix = m.type === "BROADCAST" ? "" : `[${m.type}] `;
-        return `[${ts}] ${prefix}${from}: ${m.content}`;
+        return `[${ts}] ${from}: ${m.content}`;
       });
+      return `Group '${group}' history (${messages.length}):\n${lines.join("\n")}`;
+    }),
+  );
 
-      return `Group '${group}' history (${validMessages.length}):\n${lines.join("\n")}`;
-    });
-  }
-);
-
-// Tool: messages_since
-server.registerTool(
-  "messages_since",
-  {
-    title: "Poll Messages",
-    description: "Poll for new messages since a given ID (for TUI).",
-    inputSchema: {
-      since_id: z.number().optional().default(0).describe("Return messages after this ID (0 for all)"),
-      limit: z.number().optional().default(100).describe("Max messages to return (default: 100)"),
+  server.registerTool(
+    "messages_since",
+    {
+      title: "Poll Messages",
+      description: "Poll for new messages since a given ID (for TUI).",
+      inputSchema: {
+        since_id: z.number().optional().default(0).describe("Return messages after this ID (0 for all)"),
+        limit: z.number().optional().default(100).describe("Max messages to return (default: 100)"),
+      },
+      annotations: { readOnlyHint: true },
     },
-    annotations: { readOnlyHint: true },
-  },
-  async ({ since_id, limit }) => {
-    return withMetrics("messages_since", async () => {
-      const messages = await db.getMessagesSince(since_id, limit);
-      const validMessages = messages.filter(m => m && m.id);
+    async ({ since_id, limit }) => withMeta(async () => {
+      const messages = await history.getMessagesSince(since_id || 0, limit);
+      if (messages.length === 0) return JSON.stringify({ messages: [], last_id: since_id || 0 });
+      const lastId = messages[messages.length - 1].id;
+      return JSON.stringify({ messages, last_id: lastId });
+    }),
+  );
 
-      if (validMessages.length === 0) return JSON.stringify({ messages: [], last_id: since_id });
-
-      const lastId = validMessages[validMessages.length - 1].id;
-      return JSON.stringify({ messages: validMessages, last_id: lastId });
-    });
-  }
-);
-
-// Tool: tool_metrics
-server.registerTool(
-  "tool_metrics",
-  {
-    title: "Usage Metrics",
-    description: "Get tool usage metrics (response sizes, call counts) for optimization analysis.",
-    inputSchema: {
-      days: z.number().optional().default(7).describe("Days to look back (default: 7)"),
+  server.registerTool(
+    "poll_messages",
+    {
+      title: "Poll My Messages",
+      description: "Poll for new DMs and broadcasts since last check. Returns messages addressed to you. Use from a CronCreate loop.",
+      inputSchema: {
+        name: z.string().describe("Your agent name"),
+        since_id: z.number().optional().default(0).describe("Last seen message ID (0 for first poll)"),
+      },
+      annotations: { readOnlyHint: true },
     },
-    annotations: { readOnlyHint: true },
-  },
-  async ({ days }) => {
-    return withMetrics("tool_metrics", async () => {
-      const summary = await db.getToolMetricsSummary(days);
-
-      if (summary.length === 0) return `No tool metrics in last ${days} days.`;
-
-      const totalCalls = summary.reduce((sum, t) => sum + t.call_count, 0);
-      const totalChars = summary.reduce((sum, t) => sum + t.total_chars, 0);
-
-      const lines = summary.map(t =>
-        `- ${t.tool_name}: ${t.call_count} calls, avg ${t.avg_chars} chars, total ${t.total_chars} chars${t.error_count > 0 ? ` (${t.error_count} errors)` : ""}`
-      );
-
-      return `Tool metrics (last ${days} days):\n${lines.join("\n")}\n\nTotal: ${totalCalls} calls, ${totalChars} chars (~${Math.round(totalChars / 4)} tokens)`;
-    });
-  }
-);
-
-// Tool: poll_messages
-server.registerTool(
-  "poll_messages",
-  {
-    title: "Poll My Messages",
-    description: "Poll for new DMs and broadcasts since last check. Returns messages addressed to you. Use from a CronCreate loop.",
-    inputSchema: {
-      name: z.string().describe("Your agent name"),
-      since_id: z.number().optional().default(0).describe("Last seen message ID (0 for first poll)"),
-    },
-    annotations: { readOnlyHint: true },
-  },
-  async ({ name, since_id }) => {
-    return withMetrics("poll_messages", async () => {
-      const agent = await db.getAgentByName(name);
-      if (!agent || !agent.id) {
-        return `Error: Agent '${name}' not registered. Call agent_register first.`;
-      }
-
-      const messages = await db.getMessagesForAgent(agent.id, agent.group_name || "default", since_id || 0);
-      const validMessages = messages.filter(m => m && m.id);
-
-      if (validMessages.length === 0) return JSON.stringify({ messages: [], last_id: since_id });
-
-      const lastId = validMessages[validMessages.length - 1].id;
-      const formatted = validMessages.map(m => ({
+    async ({ name, since_id }) => withMeta(async () => {
+      const agent = registry.getAgentByName(name);
+      if (!agent) return `Error: Agent '${name}' not registered. Call agent_register first.`;
+      const messages = await history.getMessagesForAgent(name, agent.group_name, since_id || 0);
+      if (messages.length === 0) return JSON.stringify({ messages: [], last_id: since_id || 0 });
+      const lastId = messages[messages.length - 1].id;
+      const formatted = messages.map((m) => ({
         id: m.id,
         type: m.type,
         from: m.from_agent?.split("-")[0] || "unknown",
         content: m.content,
       }));
-
       return JSON.stringify({ messages: formatted, last_id: lastId });
-    });
-  }
-);
+    }),
+  );
 
-async function main() {
-  await db.getDb(); // Initialize DB
-  const natsUrl = process.env.AGENTS_NATS_URL;
-  if (natsUrl) {
-    natsTransport = await initNatsTransport({
-      url: natsUrl,
-      onChannelMessage: async (msg) => {
-        try {
-          // Same-host messages were already persisted by the publisher's tool
-          // handler. Skip the write to avoid a duplicate row in the shared DB
-          // when multiple agent-mcp-server processes run on one host (tmux
-          // panes, k8s pods). Cross-host messages still replicate into the
-          // receiver's local DB as before.
-          const isOwnHost = natsTransport?.getHost() === msg.originHost;
-          if (!isOwnHost) {
-            await db.insertReplicatedChannelMessage({
-              channel: msg.channel,
-              fromAgent: msg.fromAgent,
-              content: msg.content,
-              originHost: msg.originHost,
-            });
-          }
-          logToFile("CHANNEL", `#${msg.channel} ${msg.fromAgent}@${msg.originHost}: ${msg.content}`);
-          // Push to every bound session except the sender's own, so the
-          // publisher doesn't see their own post echoed back.
-          const isSelf = !!sessionBinding && (msg.fromAgent === sessionBinding.name || msg.fromAgent === sessionBinding.agentId);
-          if (sessionBinding && natsTransport && !isSelf) {
-            const params = buildChannelNotification(msg, natsTransport.getHost());
-            await server.server.notification({ method: CHANNEL_METHOD, params });
-          }
-        } catch (err) {
-          console.error("[nats] channel handler failed:", err);
-        }
-      },
-      onDirectMessage: async (msg) => {
-        try {
-          const isOwnHost = natsTransport?.getHost() === msg.originHost;
-          if (!isOwnHost) {
-            await db.insertReplicatedDm({
-              toAgent: msg.toAgent,
-              fromAgent: msg.fromAgent,
-              content: msg.content,
-              originHost: msg.originHost,
-            });
-          }
-          logToFile("DM", `${msg.fromAgent}@${msg.originHost} -> ${msg.toAgent}: ${msg.content}`);
-          // Push only when addressed to the session's bound identity, and not
-          // when we are the sender (the tool handler already returned).
-          const isSelf = !!sessionBinding && (msg.fromAgent === sessionBinding.name || msg.fromAgent === sessionBinding.agentId);
-          if (sessionBinding && natsTransport && msg.toAgent === sessionBinding.name && !isSelf) {
-            const params = buildDmNotification(msg, natsTransport.getHost());
-            await server.server.notification({ method: CHANNEL_METHOD, params });
-          }
-        } catch (err) {
-          console.error("[nats] dm handler failed:", err);
-        }
-      },
-      onBroadcast: async (msg) => {
-        try {
-          const isOwnHost = natsTransport?.getHost() === msg.originHost;
-          if (!isOwnHost) {
-            await db.insertReplicatedBroadcast({
-              group: msg.group,
-              fromAgent: msg.fromAgent,
-              content: msg.content,
-              originHost: msg.originHost,
-            });
-          }
-          logToFile("BROADCAST", `${msg.fromAgent}@${msg.originHost} -> ${msg.group}: ${msg.content}`);
-          // Push if the bound group matches the broadcast target and we are
-          // not the sender. Same-host peers must land here — the old
-          // transport-level own-host filter silently dropped them (issue #127).
-          const isSelf = !!sessionBinding && (msg.fromAgent === sessionBinding.name || msg.fromAgent === sessionBinding.agentId);
-          if (sessionBinding && natsTransport && msg.group === sessionBinding.group && !isSelf) {
-            const params = buildBroadcastNotification(msg, natsTransport.getHost());
-            await server.server.notification({ method: CHANNEL_METHOD, params });
-          }
-        } catch (err) {
-          console.error("[nats] broadcast handler failed:", err);
-        }
-      },
-    });
-  }
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  const natsStatus = natsTransport ? ` + NATS@${natsTransport.getHost()}` : "";
-  console.error(`agents MCP v4.0.0 (tools + channel source${natsStatus}) running`);
+  return server;
 }
 
-main().catch(console.error);
+// Fan incoming NATS messages out to every bound session whose binding matches
+// the target. Own-sends are suppressed at the binding layer: the sender's
+// session sees the tool response, not an echoed <channel> tag.
+async function pushToSessions(
+  kind: "channel" | "dm" | "broadcast",
+  msg: { fromAgent: string; originHost: string; channel?: string; toAgent?: string; group?: string; content: string; originTs: number; originSeq: number },
+): Promise<void> {
+  if (!natsTransport) return;
+  const senderHost = natsTransport.getHost();
+  for (const session of sessions.values()) {
+    const binding = session.getBinding();
+    if (!binding) continue;
+    const isSelf = msg.fromAgent === binding.name || msg.fromAgent === binding.agentId;
+    if (isSelf) continue;
+    let params: unknown | null = null;
+    if (kind === "channel") {
+      params = buildChannelNotification({
+        channel: msg.channel!,
+        fromAgent: msg.fromAgent,
+        content: msg.content,
+        originHost: msg.originHost,
+        originTs: msg.originTs,
+        originSeq: msg.originSeq,
+      }, senderHost);
+    } else if (kind === "dm") {
+      if (msg.toAgent !== binding.name) continue;
+      params = buildDmNotification({
+        toAgent: msg.toAgent!,
+        fromAgent: msg.fromAgent,
+        content: msg.content,
+        originHost: msg.originHost,
+        originTs: msg.originTs,
+        originSeq: msg.originSeq,
+      }, senderHost);
+    } else {
+      if (msg.group !== binding.group) continue;
+      params = buildBroadcastNotification({
+        group: msg.group!,
+        fromAgent: msg.fromAgent,
+        content: msg.content,
+        originHost: msg.originHost,
+        originTs: msg.originTs,
+        originSeq: msg.originSeq,
+      }, senderHost);
+    }
+    try {
+      await session.server.server.notification({ method: CHANNEL_METHOD, params: params as Record<string, unknown> });
+    } catch (err) {
+      console.error("[push] notification failed:", err);
+    }
+  }
+}
+
+async function initInfra(): Promise<void> {
+  const natsUrl = process.env.AGENTS_NATS_URL || DEFAULT_NATS_URL;
+  natsTransport = await initNatsTransport({
+    url: natsUrl,
+    onChannelMessage: async (msg) => {
+      logToFile("CHANNEL", `#${msg.channel} ${msg.fromAgent}@${msg.originHost}: ${msg.content}`);
+      await pushToSessions("channel", msg);
+    },
+    onDirectMessage: async (msg) => {
+      logToFile("DM", `${msg.fromAgent}@${msg.originHost} -> ${msg.toAgent}: ${msg.content}`);
+      await pushToSessions("dm", msg);
+    },
+    onBroadcast: async (msg) => {
+      logToFile("BROADCAST", `${msg.fromAgent}@${msg.originHost} -> ${msg.group}: ${msg.content}`);
+      await pushToSessions("broadcast", msg);
+    },
+  });
+  if (!natsTransport) {
+    throw new Error(`Failed to connect to NATS at ${natsUrl}. Set AGENTS_NATS_URL or ensure the default is reachable.`);
+  }
+  registry.setPresenceSource(natsTransport);
+  const nc = natsTransport.getConnection();
+  if (!nc) throw new Error("NATS connection unavailable after init");
+  await history.init(nc);
+}
+
+async function startStdio(): Promise<void> {
+  const transport = new StdioServerTransport();
+  let binding: SessionBinding | null = null;
+  const session: Session = {
+    id: "stdio",
+    server: createMcpServer({
+      getBinding: () => binding,
+      setBinding: (b) => { binding = b; },
+    }),
+    transport,
+    getBinding: () => binding,
+    setBinding: (b) => { binding = b; },
+  };
+  sessions.set(session.id, session);
+  await session.server.connect(transport);
+  console.error(`agents MCP v${SERVER_VERSION} (stdio + NATS@${natsTransport?.getHost()}) running`);
+}
+
+async function startHttp(): Promise<void> {
+  const port = Number(process.env.AGENTS_HTTP_PORT) || 3000;
+  const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    try {
+      if (req.method === "GET" && req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok", version: SERVER_VERSION, sessions: sessions.size }));
+        return;
+      }
+      if (!req.url?.startsWith("/mcp")) {
+        res.writeHead(404).end();
+        return;
+      }
+      const body = await readBody(req);
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+      let session = sessionId ? sessions.get(sessionId) : undefined;
+      if (!session && body && isInitializeRequest(body)) {
+        session = await createHttpSession();
+      }
+      if (!session) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "No valid session ID; initialize first" }, id: null }));
+        return;
+      }
+      await (session.transport as StreamableHTTPServerTransport).handleRequest(req, res, body);
+    } catch (err) {
+      console.error("[http] request failed:", err);
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: String(err instanceof Error ? err.message : err) }));
+      }
+    }
+  });
+  httpServer.listen(port, () => {
+    console.error(`agents MCP v${SERVER_VERSION} (streamable-http:${port} + NATS@${natsTransport?.getHost()}) running`);
+  });
+}
+
+function readBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => chunks.push(c));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf-8");
+      if (!raw) return resolve(undefined);
+      try { resolve(JSON.parse(raw)); } catch (err) { reject(err); }
+    });
+    req.on("error", reject);
+  });
+}
+
+async function createHttpSession(): Promise<Session> {
+  let binding: SessionBinding | null = null;
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (id: string) => {
+      const s = pending;
+      if (!s) return;
+      s.id = id;
+      sessions.set(id, s);
+    },
+  });
+  const server = createMcpServer({
+    getBinding: () => binding,
+    setBinding: (b) => { binding = b; },
+  });
+  transport.onclose = () => {
+    if (transport.sessionId) sessions.delete(transport.sessionId);
+    const agentId = binding?.agentId;
+    if (agentId) {
+      registry.deregisterAgent(agentId);
+      if (natsTransport) natsTransport.untrackLocal(agentId);
+    }
+  };
+  await server.connect(transport);
+  const session: Session = {
+    id: "",
+    server,
+    transport,
+    getBinding: () => binding,
+    setBinding: (b) => { binding = b; },
+  };
+  pending = session;
+  return session;
+}
+
+// Bridge for the onsessioninitialized callback — the StreamableHTTP transport
+// does not pass the session object back to us, so we stash the in-flight one
+// here between construction and the init callback.
+let pending: Session | null = null;
+
+async function main(): Promise<void> {
+  await initInfra();
+  const transportMode = (process.env.AGENTS_TRANSPORT || "stdio").toLowerCase();
+  if (transportMode === "http") {
+    await startHttp();
+  } else {
+    await startStdio();
+  }
+}
+
+main().catch((err) => {
+  console.error("[fatal]", err);
+  process.exit(1);
+});
 
 process.on("SIGTERM", async () => { await natsTransport?.close(); process.exit(0); });
-process.on("SIGINT",  async () => { await natsTransport?.close(); process.exit(0); });
+process.on("SIGINT", async () => { await natsTransport?.close(); process.exit(0); });

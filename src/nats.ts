@@ -246,6 +246,13 @@ export class NatsTransport {
     return this.host;
   }
 
+  // Expose the underlying connection so other modules (e.g. history.ts'
+  // JetStream consumer) can share the single NATS connection rather than
+  // opening a second one.
+  getConnection(): NatsConnection | null {
+    return this.nc;
+  }
+
   async close(): Promise<void> {
     this.closed = true;
     if (this.heartbeatTimer) {
