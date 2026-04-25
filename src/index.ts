@@ -39,9 +39,10 @@ import {
   dmTargetIsReachable,
   broadcastGroupIsReachable,
 } from "./validation.js";
+import * as metrics from "./metrics.js";
 
 const SERVER_NAME = "agents";
-const SERVER_VERSION = "5.1.1";
+const SERVER_VERSION = "5.2.0";
 const DEFAULT_NATS_URL = "nats://nats.nats.svc:4222";
 const LOG_FILE = process.env.AGENTS_LOG_FILE || "";
 
@@ -56,6 +57,7 @@ interface Session {
   getBinding: () => SessionBinding | null;
   setBinding: (b: SessionBinding | null) => void;
   lastActivity: number;
+  createdAt: number;
 }
 
 const sessions = new Map<string, Session>();
@@ -78,16 +80,26 @@ function logToFile(type: string, content: string): void {
   } catch { /* best-effort */ }
 }
 
-// Wrap a handler so every response carries `_meta` with chars/lines/ms. The
-// old implementation also wrote per-call rows to DuckDB's tool_metrics; that
-// telemetry store is gone with #129. If anyone wants per-tool metrics again,
-// they'll land on a dedicated JetStream subject, not a relational store.
+// Wrap a handler so every response carries `_meta` with chars/lines/ms.
+// Per-tool telemetry now flows out via the prom-client `agents_tool_calls_total`
+// counter — replaces the DuckDB-backed tool_metrics table dropped in #129.
+// Errors thrown by `fn` are caught, recorded as status="err", then re-thrown
+// so the MCP layer still surfaces the failure to the caller.
 async function withMeta(
+  toolName: string,
   fn: () => Promise<string>,
 ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
   const startTime = Date.now();
-  const result = await fn();
+  let result: string;
+  try {
+    result = await fn();
+  } catch (err) {
+    metrics.toolCallsCounter.inc({ tool: toolName, status: "err" });
+    throw err;
+  }
   const durationMs = Date.now() - startTime;
+  const status = result.startsWith("Error:") ? "err" : "ok";
+  metrics.toolCallsCounter.inc({ tool: toolName, status });
   const responseChars = result.length;
   const responseLines = result.split("\n").length;
   const meta = { chars: responseChars, lines: responseLines, ms: durationMs };
@@ -121,7 +133,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ name, group }) => withMeta(async () => {
+    async ({ name, group }) => withMeta("agent_register", async () => {
       const groupName = group || "default";
       const host = natsTransport?.getHost() ?? "local";
       const agentId = registry.generateAgentId(name, host);
@@ -174,7 +186,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       inputSchema: { name: z.string().describe("Your agent name") },
       annotations: { destructiveHint: true },
     },
-    async ({ name }) => withMeta(async () => {
+    async ({ name }) => withMeta("agent_deregister", async () => {
       const agent = registry.getAgentByName(name);
       if (!agent) {
         return JSON.stringify({ success: true, name, message: "was already gone or never registered" });
@@ -206,7 +218,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ name, message, group }) => withMeta(async () => {
+    async ({ name, message, group }) => withMeta("agent_broadcast", async () => {
       const sender = registry.getAgentByName(name);
       if (!sender) return `Error: You (${name}) not registered. Call agent_register first.`;
       const bodyErr = validateMessageBody(message);
@@ -224,6 +236,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
 
       logToFile("BROADCAST", `${name} -> ${targetGroup}: ${message}`);
       natsTransport.publishBroadcast(targetGroup, name, message);
+      metrics.messagesCounter.inc({ type: "broadcast" });
       return `Broadcast published to group '${targetGroup}' over NATS. Sessions bound to that group receive it as <channel kind="broadcast">.`;
     }),
   );
@@ -240,7 +253,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ name, to, message }) => withMeta(async () => {
+    async ({ name, to, message }) => withMeta("agent_dm", async () => {
       const sender = registry.getAgentByName(name);
       if (!sender) return `Error: You (${name}) not registered. Call agent_register first.`;
       if (!natsTransport) return `Error: NATS transport not configured — DMs require AGENTS_NATS_URL.`;
@@ -258,6 +271,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
 
       logToFile("DM", `${name} -> ${to}: ${message}`);
       natsTransport.publishDirectMessage(to, name, message);
+      metrics.messagesCounter.inc({ type: "dm" });
       return `DM published to '${to}' over NATS. Live delivery happens when the recipient session is registered (agent_register auto-binds); otherwise the message stays in dm_history for catch-up.`;
     }),
   );
@@ -273,7 +287,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ group }) => withMeta(async () => {
+    async ({ group }) => withMeta("agent_discover", async () => {
       const agents = registry.getAgents(group || undefined);
       if (agents.length === 0) {
         return group ? `No agents in group '${group}'` : "No agents currently registered.";
@@ -297,7 +311,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },
-    async () => withMeta(async () => {
+    async () => withMeta("agent_groups", async () => {
       const groups = registry.getGroups();
       if (groups.length === 0) return "No agents registered.";
       const lines = groups.map((g) => `- ${g.group_name} (${g.count} agent${g.count > 1 ? "s" : ""})`);
@@ -317,10 +331,11 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ name, channel, message }) => withMeta(async () => {
+    async ({ name, channel, message }) => withMeta("channel_send", async () => {
       if (!natsTransport) return `Error: NATS transport not configured — channels require AGENTS_NATS_URL.`;
       logToFile("CHANNEL", `#${channel} ${name}: ${message}`);
       natsTransport.publishChannelMessage(channel, name, message);
+      metrics.messagesCounter.inc({ type: "channel" });
       return `Message logged to #${channel}`;
     }),
   );
@@ -337,7 +352,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ channel, limit, detailed }) => withMeta(async () => {
+    async ({ channel, limit, detailed }) => withMeta("channel_history", async () => {
       const messages = await history.getChannelHistory(channel, limit);
       if (messages.length === 0) return `No messages in #${channel}`;
       if (detailed) {
@@ -374,7 +389,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ name, with_agent, limit, detailed }) => withMeta(async () => {
+    async ({ name, with_agent, limit, detailed }) => withMeta("dm_history", async () => {
       const messages = await history.getDmHistory(name, with_agent, limit);
       if (messages.length === 0) return `No DM history with ${with_agent}`;
       if (detailed) {
@@ -407,7 +422,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },
-    async () => withMeta(async () => {
+    async () => withMeta("channel_list", async () => {
       const channels = await history.getChannels();
       if (channels.length === 0) return "No channels with messages yet.";
       const lines = channels.map((c) => `- #${c.channel} (${c.message_count} messages)`);
@@ -426,7 +441,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ group, limit }) => withMeta(async () => {
+    async ({ group, limit }) => withMeta("group_history", async () => {
       const messages = await history.getGroupHistory(group, limit);
       if (messages.length === 0) return `No history for group '${group}'`;
       const lines = messages.map((m) => {
@@ -449,7 +464,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ since_id, limit }) => withMeta(async () => {
+    async ({ since_id, limit }) => withMeta("messages_since", async () => {
       const messages = await history.getMessagesSince(since_id || 0, limit);
       if (messages.length === 0) return JSON.stringify({ messages: [], last_id: since_id || 0 });
       const lastId = messages[messages.length - 1].id;
@@ -468,7 +483,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ name, since_id }) => withMeta(async () => {
+    async ({ name, since_id }) => withMeta("poll_messages", async () => {
       const agent = registry.getAgentByName(name);
       if (!agent) return `Error: Agent '${name}' not registered. Call agent_register first.`;
       const messages = await history.getMessagesForAgent(name, agent.group_name, since_id || 0);
@@ -496,11 +511,18 @@ async function pushOne(session: Session, params: Record<string, unknown>): Promi
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error("push timeout")), PUSH_TIMEOUT_MS);
   });
+  const stopTimer = metrics.pushDurationHistogram.startTimer();
   try {
     await Promise.race([
       session.server.server.notification({ method: CHANNEL_METHOD, params }),
       timeout,
     ]);
+    stopTimer();
+  } catch (err) {
+    stopTimer();
+    const kind = err instanceof Error && err.message === "push timeout" ? "timeout" : "other";
+    metrics.pushErrorsCounter.inc({ kind });
+    throw err;
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -600,6 +622,7 @@ async function startStdio(): Promise<void> {
     getBinding,
     setBinding,
     lastActivity: Date.now(),
+    createdAt: Date.now(),
   };
   sessions.set(session.id, session);
   await session.server.connect(transport);
@@ -613,6 +636,12 @@ async function startHttp(): Promise<void> {
       if (req.method === "GET" && req.url === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "ok", version: SERVER_VERSION, sessions: sessions.size }));
+        return;
+      }
+      if (req.method === "GET" && req.url === "/metrics" && metrics.isEnabled()) {
+        const out = await metrics.renderMetrics();
+        res.writeHead(200, { "Content-Type": out.contentType });
+        res.end(out.body);
         return;
       }
       if (!req.url?.startsWith("/mcp")) {
@@ -640,6 +669,30 @@ async function startHttp(): Promise<void> {
       }
     }
   });
+  metrics.bindSnapshotSources({
+    countSessions: () => sessions.size,
+    countUnboundSessions: () => {
+      let n = 0;
+      for (const s of sessions.values()) if (s.getBinding() === null) n++;
+      return n;
+    },
+    countBindingsByGroup: () => {
+      const counts = new Map<string, number>();
+      for (const s of sessions.values()) {
+        const b = s.getBinding();
+        if (b) counts.set(b.group, (counts.get(b.group) ?? 0) + 1);
+      }
+      return counts;
+    },
+    countActiveAgentsByGroup: () => {
+      const counts = new Map<string, number>();
+      for (const a of registry.getAgents()) {
+        counts.set(a.group_name, (counts.get(a.group_name) ?? 0) + 1);
+      }
+      return counts;
+    },
+  });
+
   httpServer.listen(port, () => {
     console.error(`agents MCP v${SERVER_VERSION} (streamable-http:${port} + NATS@${natsTransport?.getHost()}) running`);
   });
@@ -654,6 +707,7 @@ async function startHttp(): Promise<void> {
     for (const [id, s] of sessions.entries()) {
       if (s.getBinding() !== null) continue;
       if (now - s.lastActivity < UNBOUND_SESSION_TIMEOUT_MS) continue;
+      metrics.sessionAgeHistogram.observe((now - s.createdAt) / 1000);
       try {
         const t = s.transport as StreamableHTTPServerTransport;
         if (typeof t.close === "function") void t.close();
@@ -678,6 +732,7 @@ function readBody(req: IncomingMessage): Promise<unknown> {
 
 async function createHttpSession(): Promise<Session> {
   let binding: SessionBinding | null = null;
+  let sessionRef: Session | null = null;
   const getBinding = () => binding;
   const setBinding = (b: SessionBinding | null) => { binding = b; };
   const transport = new StreamableHTTPServerTransport({
@@ -691,6 +746,8 @@ async function createHttpSession(): Promise<Session> {
   });
   const server = createMcpServer({ getBinding, setBinding });
   transport.onclose = () => {
+    const ageMs = Date.now() - (sessionRef?.createdAt ?? Date.now());
+    metrics.sessionAgeHistogram.observe(ageMs / 1000);
     if (transport.sessionId) sessions.delete(transport.sessionId);
     const agentId = binding?.agentId;
     if (agentId) {
@@ -706,7 +763,9 @@ async function createHttpSession(): Promise<Session> {
     getBinding,
     setBinding,
     lastActivity: Date.now(),
+    createdAt: Date.now(),
   };
+  sessionRef = session;
   pending = session;
   return session;
 }
