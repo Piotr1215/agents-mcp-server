@@ -41,7 +41,7 @@ import {
 } from "./validation.js";
 
 const SERVER_NAME = "agents";
-const SERVER_VERSION = "5.1.0";
+const SERVER_VERSION = "5.1.1";
 const DEFAULT_NATS_URL = "nats://nats.nats.svc:4222";
 const LOG_FILE = process.env.AGENTS_LOG_FILE || "";
 

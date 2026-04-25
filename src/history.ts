@@ -102,11 +102,29 @@ async function drain(filterSubjects: string[], limit: number, minSeq?: number): 
   } else if (filterSubjects.length > 1) {
     consumerConfig.filter_subjects = filterSubjects;
   }
+
+  // For paginated reads (since_id), `by_start_sequence` is exact. For "latest
+  // N" reads, deliver_policy:"all" + max_messages:limit returns the OLDEST N
+  // because JetStream serves matching messages in stream-seq ascending order.
+  // To return the NEWEST N, fetch every matching message (bounded by the
+  // per-subject retention cap, default 10k) and slice the tail. The cost is
+  // bounded; correctness is exact.
+  let fetchLimit = limit;
   if (minSeq && minSeq > 0) {
     consumerConfig.deliver_policy = "by_start_sequence";
     consumerConfig.opt_start_seq = minSeq + 1;
   } else {
     consumerConfig.deliver_policy = "all";
+    try {
+      const streamInfo = await jsm.streams.info(STREAM_NAME, {
+        subjects_filter: filterSubjects[0],
+      } as never);
+      const subjectCounts = (streamInfo.state as { subjects?: Record<string, number> }).subjects ?? {};
+      const matchingTotal = Object.values(subjectCounts).reduce((a, b) => a + b, 0);
+      if (matchingTotal > 0) fetchLimit = matchingTotal;
+    } catch (err) {
+      console.error("[history] subject info fetch failed, falling back to limit:", err);
+    }
   }
 
   const info = await jsm.consumers.add(STREAM_NAME, consumerConfig as never);
@@ -116,7 +134,7 @@ async function drain(filterSubjects: string[], limit: number, minSeq?: number): 
     const consumer = await js.consumers.get(STREAM_NAME, consumerName);
     // nats.js rejects expires < 1000ms. Keep this tight enough that history
     // queries don't stall on empty streams, but above the client's floor.
-    const iter = await consumer.fetch({ max_messages: limit, expires: 1000 });
+    const iter = await consumer.fetch({ max_messages: fetchLimit, expires: 1000 });
     for await (const m of iter) {
       try {
         const payload = JSON.parse(Buffer.from(m.data).toString("utf-8"));
@@ -134,6 +152,11 @@ async function drain(filterSubjects: string[], limit: number, minSeq?: number): 
     await jsm.consumers.delete(STREAM_NAME, consumerName).catch(() => { /* best effort */ });
   }
   out.sort((a, b) => a.stream_seq - b.stream_seq);
+  // For "latest N" reads, the fetch above pulled every matching message; slice
+  // off the head so callers get the newest `limit`.
+  if (!minSeq || minSeq <= 0) {
+    if (out.length > limit) out.splice(0, out.length - limit);
+  }
   return out;
 }
 
