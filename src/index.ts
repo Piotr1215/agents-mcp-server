@@ -42,7 +42,7 @@ import {
 import * as metrics from "./metrics.js";
 
 const SERVER_NAME = "agents";
-const SERVER_VERSION = "5.2.0";
+const SERVER_VERSION = "5.3.0";
 const DEFAULT_NATS_URL = "nats://nats.nats.svc:4222";
 const LOG_FILE = process.env.AGENTS_LOG_FILE || "";
 
@@ -502,10 +502,31 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
   return server;
 }
 
+// Detect whether the standalone GET-SSE stream that carries server-pushed
+// notifications is still attached. The SDK's web-standard transport stores
+// active streams in `_streamMapping`; the standalone push stream uses the
+// literal "_GET_stream" key. When the consumer (Envoy idle-cut, NAT death,
+// laptop sleep) cancels that stream, the SDK silently deletes the entry and
+// `notification()` keeps resolving without an error — every push from then
+// on is dropped on the floor while metrics show "delivered". Peeking at the
+// private map after a successful push is the only signal we have until the
+// SDK exposes a stream-state hook upstream.
+const STANDALONE_SSE_KEY = "_GET_stream";
+const SSE_DEAD_ERROR = "sse cancelled";
+
+function isPushChannelAlive(transport: StreamableHTTPServerTransport): boolean {
+  const ws = (transport as unknown as {
+    _webStandardTransport?: { _streamMapping?: { has?: (key: string) => boolean } };
+  })._webStandardTransport;
+  return ws?._streamMapping?.has?.(STANDALONE_SSE_KEY) === true;
+}
+
 // Push one notification with a hard timeout so a single hung transport (a
 // closed SSE whose client never sent DELETE /mcp) cannot stall the fan-out
 // to every other bound session — the bug that caused snd → bound-session
-// delivery to silently fail in 5.0.0.
+// delivery to silently fail in 5.0.0. After the SDK resolves, also probe the
+// underlying SSE: if it has been cancelled the push was a no-op, so evict
+// the session so the next agent_register can rebind under a live stream.
 async function pushOne(session: Session, params: Record<string, unknown>): Promise<void> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
@@ -518,10 +539,26 @@ async function pushOne(session: Session, params: Record<string, unknown>): Promi
       timeout,
     ]);
     stopTimer();
+    if (
+      session.transport instanceof StreamableHTTPServerTransport &&
+      !isPushChannelAlive(session.transport)
+    ) {
+      throw new Error(SSE_DEAD_ERROR);
+    }
   } catch (err) {
     stopTimer();
-    const kind = err instanceof Error && err.message === "push timeout" ? "timeout" : "other";
+    let kind: "timeout" | "sse-dead" | "other" = "other";
+    if (err instanceof Error) {
+      if (err.message === "push timeout") kind = "timeout";
+      else if (err.message === SSE_DEAD_ERROR) kind = "sse-dead";
+    }
     metrics.pushErrorsCounter.inc({ kind });
+    if (kind === "sse-dead" && session.transport instanceof StreamableHTTPServerTransport) {
+      // Force the transport's onclose chain to fire (deregisters the agent and
+      // drops the binding), so the next agent_register call from this client
+      // can claim the name without colliding with a stale binding.
+      try { void session.transport.close(); } catch { /* best-effort */ }
+    }
     throw err;
   } finally {
     if (timer) clearTimeout(timer);
