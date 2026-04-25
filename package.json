@@ -1,6 +1,6 @@
 {
   "name": "agents-mcp-server",
-  "version": "5.2.0",
+  "version": "5.1.1",
   "description": "MCP server for agent-to-agent communication over NATS (stdio + streamable-HTTP)",
   "main": "build/index.js",
   "bin": {
@@ -30,8 +30,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "nats": "^2.29.3",
-    "prom-client": "^15.1.3"
+    "nats": "^2.29.3"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
