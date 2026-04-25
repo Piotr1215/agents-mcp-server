@@ -41,7 +41,7 @@ import {
 } from "./validation.js";
 
 const SERVER_NAME = "agents";
-const SERVER_VERSION = "5.0.0";
+const SERVER_VERSION = "5.1.0";
 const DEFAULT_NATS_URL = "nats://nats.nats.svc:4222";
 const LOG_FILE = process.env.AGENTS_LOG_FILE || "";
 
@@ -55,9 +55,20 @@ interface Session {
   transport: StdioServerTransport | StreamableHTTPServerTransport;
   getBinding: () => SessionBinding | null;
   setBinding: (b: SessionBinding | null) => void;
+  lastActivity: number;
 }
 
 const sessions = new Map<string, Session>();
+
+// Tunables for HTTP-mode session housekeeping. Defaults err on the side of
+// dropping unbound sessions quickly (clients that initialize but never call
+// agent_register are almost always dead reconnects) while leaving bound
+// sessions alone — those carry live agent identity and must not be reaped
+// just for being quiet. PUSH_TIMEOUT_MS guards against a single dead SSE
+// stalling fan-out to every other bound session.
+const UNBOUND_SESSION_TIMEOUT_MS = Number(process.env.AGENTS_UNBOUND_TIMEOUT_MS) || 60_000;
+const SESSION_SWEEP_INTERVAL_MS = Number(process.env.AGENTS_SWEEP_INTERVAL_MS) || 30_000;
+const PUSH_TIMEOUT_MS = Number(process.env.AGENTS_PUSH_TIMEOUT_MS) || 1_000;
 
 function logToFile(type: string, content: string): void {
   if (!LOG_FILE) return;
@@ -114,6 +125,23 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       const groupName = group || "default";
       const host = natsTransport?.getHost() ?? "local";
       const agentId = registry.generateAgentId(name, host);
+
+      // Evict any other session that previously bound this name. Without
+      // this, a stale session left over from a /mcp reconnect (or a crashed
+      // client whose transport.onclose never fired) keeps a dead binding
+      // for the same name. pushToSessions then fans out notifications to
+      // both — the live session and the dead transport — and the dead one
+      // can stall the await chain. One name, one bound session.
+      for (const s of sessions.values()) {
+        if (s.setBinding === session.setBinding) continue;
+        const b = s.getBinding();
+        if (b && b.name === name) {
+          s.setBinding(null);
+          registry.deregisterAgent(b.agentId);
+          if (natsTransport) natsTransport.untrackLocal(b.agentId);
+        }
+      }
+
       registry.registerAgent(agentId, name, groupName);
 
       const peers = registry
@@ -459,15 +487,36 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
   return server;
 }
 
+// Push one notification with a hard timeout so a single hung transport (a
+// closed SSE whose client never sent DELETE /mcp) cannot stall the fan-out
+// to every other bound session — the bug that caused snd → bound-session
+// delivery to silently fail in 5.0.0.
+async function pushOne(session: Session, params: Record<string, unknown>): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("push timeout")), PUSH_TIMEOUT_MS);
+  });
+  try {
+    await Promise.race([
+      session.server.server.notification({ method: CHANNEL_METHOD, params }),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // Fan incoming NATS messages out to every bound session whose binding matches
 // the target. Own-sends are suppressed at the binding layer: the sender's
-// session sees the tool response, not an echoed <channel> tag.
+// session sees the tool response, not an echoed <channel> tag. Pushes run in
+// parallel — serial await behind a dead transport was the stall.
 async function pushToSessions(
   kind: "channel" | "dm" | "broadcast",
   msg: { fromAgent: string; originHost: string; channel?: string; toAgent?: string; group?: string; content: string; originTs: number; originSeq: number },
 ): Promise<void> {
   if (!natsTransport) return;
   const senderHost = natsTransport.getHost();
+  const tasks: Promise<void>[] = [];
   for (const session of sessions.values()) {
     const binding = session.getBinding();
     if (!binding) continue;
@@ -504,12 +553,13 @@ async function pushToSessions(
         originSeq: msg.originSeq,
       }, senderHost);
     }
-    try {
-      await session.server.server.notification({ method: CHANNEL_METHOD, params: params as Record<string, unknown> });
-    } catch (err) {
-      console.error("[push] notification failed:", err);
-    }
+    tasks.push(
+      pushOne(session, params as Record<string, unknown>).catch((err) => {
+        console.error("[push] notification failed:", err instanceof Error ? err.message : err);
+      }),
+    );
   }
+  await Promise.all(tasks);
 }
 
 async function initInfra(): Promise<void> {
@@ -541,15 +591,15 @@ async function initInfra(): Promise<void> {
 async function startStdio(): Promise<void> {
   const transport = new StdioServerTransport();
   let binding: SessionBinding | null = null;
+  const getBinding = () => binding;
+  const setBinding = (b: SessionBinding | null) => { binding = b; };
   const session: Session = {
     id: "stdio",
-    server: createMcpServer({
-      getBinding: () => binding,
-      setBinding: (b) => { binding = b; },
-    }),
+    server: createMcpServer({ getBinding, setBinding }),
     transport,
-    getBinding: () => binding,
-    setBinding: (b) => { binding = b; },
+    getBinding,
+    setBinding,
+    lastActivity: Date.now(),
   };
   sessions.set(session.id, session);
   await session.server.connect(transport);
@@ -580,6 +630,7 @@ async function startHttp(): Promise<void> {
         res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "No valid session ID; initialize first" }, id: null }));
         return;
       }
+      session.lastActivity = Date.now();
       await (session.transport as StreamableHTTPServerTransport).handleRequest(req, res, body);
     } catch (err) {
       console.error("[http] request failed:", err);
@@ -592,6 +643,24 @@ async function startHttp(): Promise<void> {
   httpServer.listen(port, () => {
     console.error(`agents MCP v${SERVER_VERSION} (streamable-http:${port} + NATS@${natsTransport?.getHost()}) running`);
   });
+
+  // Sweep unbound HTTP sessions whose transport.onclose never fired (laptop
+  // sleeps, network drops, /mcp reconnect without a clean DELETE). Bound
+  // sessions are left alone — agent identity is presumed live until the
+  // owning client deregisters or the transport actually closes. The leak
+  // before this fix went unbound→3-digit session counts in under an hour.
+  setInterval(() => {
+    const now = Date.now();
+    for (const [id, s] of sessions.entries()) {
+      if (s.getBinding() !== null) continue;
+      if (now - s.lastActivity < UNBOUND_SESSION_TIMEOUT_MS) continue;
+      try {
+        const t = s.transport as StreamableHTTPServerTransport;
+        if (typeof t.close === "function") void t.close();
+      } catch { /* best-effort */ }
+      sessions.delete(id);
+    }
+  }, SESSION_SWEEP_INTERVAL_MS).unref();
 }
 
 function readBody(req: IncomingMessage): Promise<unknown> {
@@ -609,6 +678,8 @@ function readBody(req: IncomingMessage): Promise<unknown> {
 
 async function createHttpSession(): Promise<Session> {
   let binding: SessionBinding | null = null;
+  const getBinding = () => binding;
+  const setBinding = (b: SessionBinding | null) => { binding = b; };
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
     onsessioninitialized: (id: string) => {
@@ -618,10 +689,7 @@ async function createHttpSession(): Promise<Session> {
       sessions.set(id, s);
     },
   });
-  const server = createMcpServer({
-    getBinding: () => binding,
-    setBinding: (b) => { binding = b; },
-  });
+  const server = createMcpServer({ getBinding, setBinding });
   transport.onclose = () => {
     if (transport.sessionId) sessions.delete(transport.sessionId);
     const agentId = binding?.agentId;
@@ -635,8 +703,9 @@ async function createHttpSession(): Promise<Session> {
     id: "",
     server,
     transport,
-    getBinding: () => binding,
-    setBinding: (b) => { binding = b; },
+    getBinding,
+    setBinding,
+    lastActivity: Date.now(),
   };
   pending = session;
   return session;
