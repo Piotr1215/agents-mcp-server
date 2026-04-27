@@ -185,6 +185,29 @@ describe("NatsTransport", () => {
     await t.close();
   });
 
+  // Issue #127 (presence parity): the transport used to silently drop
+  // same-host presence beats from sibling agent-mcp-server processes (each
+  // Claude session spawns its own stdio MCP server). Filtering on
+  // beat.host === this.host hid those siblings from agent_discover. Loopback
+  // dedup is now agent_id-based via this.locals — host-level filtering is too
+  // broad for multi-agent-per-host deployments.
+  it("includes same-host peers from sibling processes (agent_id-based loopback dedup)", async () => {
+    const t = new NatsTransport({
+      url: "fake",
+      host: "host-a",
+      connector: async () => fakeConnection(bus),
+      now: () => 1_000,
+    });
+    await t.start();
+    t.trackLocal({ agent_id: "me-abc", name: "me", group: "default" });
+    t.ingestBeat({ agent_id: "me-abc",      name: "me",      group: "default", host: "host-a", ts: 1_000 });
+    t.ingestBeat({ agent_id: "sibling-xyz", name: "sibling", group: "default", host: "host-a", ts: 1_000 });
+
+    const peers = t.getRemotePeers();
+    expect(peers.map((p) => p.agent_id)).toEqual(["sibling-xyz"]);
+    await t.close();
+  });
+
   it("delivers a beat end-to-end through subscribe loop", async () => {
     const t = new NatsTransport({
       url: "fake",

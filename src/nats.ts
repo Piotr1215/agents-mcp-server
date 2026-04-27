@@ -231,11 +231,15 @@ export class NatsTransport {
         this.peers.delete(id);
         continue;
       }
+      // Own-process loopback (we receive our own beat back via the wildcard
+      // subscription) is filtered by agent_id — trackLocal keeps `this.locals`
+      // in sync with the registry, so the publisher's own beats never escape
+      // here. Filtering by beat.host instead would break multi-agent-per-host
+      // deployments (tmux panes, k8s pods sharing a hostname): every sibling
+      // process has a distinct agent_id but the same hostname, and host-level
+      // filtering silently hides them from agent_discover. See issue #127 for
+      // the symmetric fix on channel/dm/broadcast paths.
       if (this.locals.has(id)) continue;
-      // Own-host peers also reach us via wildcard subscribe — drop them so
-      // agent_discover does not render local agents twice (once local, once
-      // as "remote" from our own presence beat loopback).
-      if (beat.host === this.host) continue;
       if (group && beat.group !== group) continue;
       result.push(beat);
     }
