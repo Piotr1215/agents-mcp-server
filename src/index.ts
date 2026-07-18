@@ -39,6 +39,11 @@ import {
   dmTargetIsReachable,
   broadcastGroupIsReachable,
 } from "./validation.js";
+import {
+  CodexAppServerSocket,
+  deliverCodexNudge,
+  readCodexThreadBinding,
+} from "./codex-nudges.js";
 
 const SERVER_NAME = "agents";
 const SERVER_VERSION = "5.1.1";
@@ -56,6 +61,7 @@ interface Session {
   getBinding: () => SessionBinding | null;
   setBinding: (b: SessionBinding | null) => void;
   lastActivity: number;
+  codexBridge?: CodexAppServerSocket;
 }
 
 const sessions = new Map<string, Session>();
@@ -542,6 +548,21 @@ async function pushToSessions(
         originTs: msg.originTs,
         originSeq: msg.originSeq,
       }, senderHost);
+      const codexThreadId = process.env.AGENTS_CODEX_NUDGES === "0"
+        ? null
+        : readCodexThreadBinding(binding.name);
+      if (codexThreadId) {
+        session.codexBridge ??= new CodexAppServerSocket();
+        tasks.push(
+          deliverCodexNudge(session.codexBridge, codexThreadId, {
+            fromAgent: msg.fromAgent,
+            content: msg.content,
+            originHost: msg.originHost,
+          }).then(() => undefined).catch((err) => {
+            console.error("[codex-nudge] delivery failed:", err instanceof Error ? err.message : err);
+          }),
+        );
+      }
     } else {
       if (msg.group !== binding.group) continue;
       params = buildBroadcastNotification({
