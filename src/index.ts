@@ -42,7 +42,7 @@ import {
 import {
   CodexAppServerSocket,
   deliverCodexNudge,
-  readCodexThreadBinding,
+  readCodexBinding,
 } from "./codex-nudges.js";
 
 const SERVER_NAME = "agents";
@@ -62,6 +62,7 @@ interface Session {
   setBinding: (b: SessionBinding | null) => void;
   lastActivity: number;
   codexBridge?: CodexAppServerSocket;
+  codexBridgeSocket?: string;
 }
 
 const sessions = new Map<string, Session>();
@@ -548,21 +549,6 @@ async function pushToSessions(
         originTs: msg.originTs,
         originSeq: msg.originSeq,
       }, senderHost);
-      const codexThreadId = process.env.AGENTS_CODEX_NUDGES === "0"
-        ? null
-        : readCodexThreadBinding(binding.name);
-      if (codexThreadId) {
-        session.codexBridge ??= new CodexAppServerSocket();
-        tasks.push(
-          deliverCodexNudge(session.codexBridge, codexThreadId, {
-            fromAgent: msg.fromAgent,
-            content: msg.content,
-            originHost: msg.originHost,
-          }).then(() => undefined).catch((err) => {
-            console.error("[codex-nudge] delivery failed:", err instanceof Error ? err.message : err);
-          }),
-        );
-      }
     } else {
       if (msg.group !== binding.group) continue;
       params = buildBroadcastNotification({
@@ -573,6 +559,29 @@ async function pushToSessions(
         originTs: msg.originTs,
         originSeq: msg.originSeq,
       }, senderHost);
+    }
+    const codexBinding = process.env.AGENTS_CODEX_NUDGES === "0"
+      ? null
+      : readCodexBinding(binding.name);
+    if (codexBinding) {
+      const socketPath = codexBinding.socketPath ?? "";
+      if (!session.codexBridge || session.codexBridgeSocket !== socketPath) {
+        session.codexBridge?.close();
+        session.codexBridge = new CodexAppServerSocket(codexBinding.socketPath);
+        session.codexBridgeSocket = socketPath;
+      }
+      tasks.push(
+        deliverCodexNudge(session.codexBridge, codexBinding.threadId, {
+          fromAgent: msg.fromAgent,
+          content: msg.content,
+          originHost: msg.originHost,
+          kind,
+          ...(kind === "broadcast" ? { group: msg.group } : {}),
+          ...(kind === "channel" ? { channel: msg.channel } : {}),
+        }).then(() => undefined).catch((err) => {
+          console.error("[codex-nudge] delivery failed:", err instanceof Error ? err.message : err);
+        }),
+      );
     }
     tasks.push(
       pushOne(session, params as Record<string, unknown>).catch((err) => {

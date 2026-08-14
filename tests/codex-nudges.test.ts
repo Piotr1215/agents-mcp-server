@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   deliverCodexNudge,
   encodeClientTextFrame,
+  readCodexBinding,
   readCodexThreadBinding,
   type AppServerRpc,
 } from "../src/codex-nudges.js";
@@ -46,6 +47,23 @@ describe("deliverCodexNudge", () => {
       threadId: "thread-1",
       expectedTurnId: "turn-live",
       input: [{ type: "text", text: "<dm> [klod@serval] Hostile entered local" }],
+    });
+  });
+
+  it("labels group broadcasts distinctly from direct messages", async () => {
+    const rpc = rpcWithThread({ status: { type: "idle" }, turns: [] });
+
+    expect(await deliverCodexNudge(rpc, "thread-1", {
+      ...message,
+      kind: "broadcast",
+      group: "rag-eval",
+    })).toBe("started");
+    expect(rpc.request).toHaveBeenLastCalledWith("turn/start", {
+      threadId: "thread-1",
+      input: [{
+        type: "text",
+        text: "<bcast group=\"rag-eval\"> [klod@serval] Hostile entered local",
+      }],
     });
   });
 
@@ -105,6 +123,19 @@ describe("readCodexThreadBinding", () => {
 
     expect(readCodexThreadBinding("greta/kube", "/codex", readText)).toBe("thread-123");
     expect(readText).toHaveBeenCalledWith("/codex/agent-bindings/greta%2Fkube.json");
+  });
+
+  it("reads the pane-specific app-server socket with the thread", () => {
+    const readText = vi.fn(() => JSON.stringify({
+      agent: "greta",
+      thread_id: "thread-123",
+      socket_path: "/codex/app-server-control/pane/app-server-control.sock",
+    }));
+
+    expect(readCodexBinding("greta", "/codex", readText)).toEqual({
+      threadId: "thread-123",
+      socketPath: "/codex/app-server-control/pane/app-server-control.sock",
+    });
   });
 
   it("returns null for a missing or malformed binding", () => {

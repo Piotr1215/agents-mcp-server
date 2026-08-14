@@ -12,6 +12,14 @@ export interface CodexNudge {
   fromAgent: string;
   content: string;
   originHost: string;
+  kind?: "dm" | "broadcast" | "channel";
+  group?: string;
+  channel?: string;
+}
+
+export interface CodexBinding {
+  threadId: string;
+  socketPath?: string;
 }
 
 type DeliveryResult = "started" | "steered" | "skipped";
@@ -22,7 +30,10 @@ interface ThreadSnapshot {
 }
 
 function nudgeText(message: CodexNudge): string {
-  return `<dm> [${message.fromAgent}@${message.originHost}] ${message.content}`;
+  let tag = "<dm>";
+  if (message.kind === "broadcast") tag = `<bcast group="${message.group ?? "default"}">`;
+  if (message.kind === "channel") tag = `<channel name="${message.channel ?? "default"}">`;
+  return `${tag} [${message.fromAgent}@${message.originHost}] ${message.content}`;
 }
 
 async function readThread(rpc: AppServerRpc, threadId: string): Promise<ThreadSnapshot> {
@@ -79,10 +90,27 @@ export function readCodexThreadBinding(
   codexHome = defaultCodexHome(),
   readText: (path: string) => string = (path) => readFileSync(path, "utf8"),
 ): string | null {
+  return readCodexBinding(agentName, codexHome, readText)?.threadId ?? null;
+}
+
+export function readCodexBinding(
+  agentName: string,
+  codexHome = defaultCodexHome(),
+  readText: (path: string) => string = (path) => readFileSync(path, "utf8"),
+): CodexBinding | null {
   const bindingPath = join(codexHome, "agent-bindings", `${encodeURIComponent(agentName)}.json`);
   try {
-    const binding = JSON.parse(readText(bindingPath)) as { thread_id?: unknown };
-    return typeof binding.thread_id === "string" && binding.thread_id ? binding.thread_id : null;
+    const binding = JSON.parse(readText(bindingPath)) as {
+      thread_id?: unknown;
+      socket_path?: unknown;
+    };
+    if (typeof binding.thread_id !== "string" || !binding.thread_id) return null;
+    return {
+      threadId: binding.thread_id,
+      ...(typeof binding.socket_path === "string" && binding.socket_path
+        ? { socketPath: binding.socket_path }
+        : {}),
+    };
   } catch {
     return null;
   }
