@@ -4,6 +4,8 @@ import {
   encodeClientTextFrame,
   readCodexBinding,
   readCodexThreadBinding,
+  resolveCodexHome,
+  resolveCodexSocketPath,
   type AppServerRpc,
 } from "../src/codex-nudges.js";
 
@@ -141,5 +143,30 @@ describe("readCodexThreadBinding", () => {
   it("returns null for a missing or malformed binding", () => {
     expect(readCodexThreadBinding("greta", "/codex", () => { throw new Error("missing"); })).toBeNull();
     expect(readCodexThreadBinding("greta", "/codex", () => "{}" )).toBeNull();
+  });
+});
+
+describe("Codex MCP environment", () => {
+  it("prefers the dedicated agents binding root over the generic Codex home", () => {
+    expect(resolveCodexHome({
+      AGENTS_CODEX_HOME: "/codex/work",
+      CODEX_HOME: "/codex/personal",
+    }, "/home/tester")).toBe("/codex/work");
+  });
+
+  it("prefers the dedicated pane socket over the generic app-server socket", () => {
+    expect(resolveCodexSocketPath({
+      AGENTS_CODEX_APP_SERVER_SOCKET: "/codex/work/pane.sock",
+      CODEX_APP_SERVER_SOCKET: "/codex/personal/global.sock",
+    }, "/home/tester")).toBe("/codex/work/pane.sock");
+  });
+
+  it("keeps the legacy Codex environment as a fallback", () => {
+    const env = { CODEX_HOME: "/codex/legacy" };
+
+    expect(resolveCodexHome(env, "/home/tester")).toBe("/codex/legacy");
+    expect(resolveCodexSocketPath(env, "/home/tester")).toBe(
+      "/codex/legacy/app-server-control/app-server-control.sock",
+    );
   });
 });

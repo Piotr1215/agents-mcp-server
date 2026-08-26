@@ -87,7 +87,7 @@ export function encodeClientTextFrame(text: string, mask = randomBytes(4)): Buff
 
 export function readCodexThreadBinding(
   agentName: string,
-  codexHome = defaultCodexHome(),
+  codexHome = resolveCodexHome(),
   readText: (path: string) => string = (path) => readFileSync(path, "utf8"),
 ): string | null {
   return readCodexBinding(agentName, codexHome, readText)?.threadId ?? null;
@@ -95,7 +95,7 @@ export function readCodexThreadBinding(
 
 export function readCodexBinding(
   agentName: string,
-  codexHome = defaultCodexHome(),
+  codexHome = resolveCodexHome(),
   readText: (path: string) => string = (path) => readFileSync(path, "utf8"),
 ): CodexBinding | null {
   const bindingPath = join(codexHome, "agent-bindings", `${encodeURIComponent(agentName)}.json`);
@@ -148,7 +148,7 @@ export class CodexAppServerSocket implements AppServerRpc {
   private handshakeDone = false;
   private nextId = 1;
 
-  constructor(socketPath = defaultSocketPath()) {
+  constructor(socketPath = resolveCodexSocketPath()) {
     this.socket = createConnection(socketPath);
     this.connected = this.handshake();
     this.socket.on("error", (error) => this.rejectPending(error));
@@ -280,11 +280,18 @@ export class CodexAppServerSocket implements AppServerRpc {
   }
 }
 
-function defaultSocketPath(): string {
-  if (process.env.CODEX_APP_SERVER_SOCKET) return process.env.CODEX_APP_SERVER_SOCKET;
-  return join(defaultCodexHome(), "app-server-control", "app-server-control.sock");
+export function resolveCodexSocketPath(
+  env: NodeJS.ProcessEnv = process.env,
+  home = homedir(),
+): string {
+  if (env.AGENTS_CODEX_APP_SERVER_SOCKET) return env.AGENTS_CODEX_APP_SERVER_SOCKET;
+  if (env.CODEX_APP_SERVER_SOCKET) return env.CODEX_APP_SERVER_SOCKET;
+  return join(resolveCodexHome(env, home), "app-server-control", "app-server-control.sock");
 }
 
-function defaultCodexHome(): string {
-  return process.env.CODEX_HOME || join(homedir(), ".codex");
+export function resolveCodexHome(
+  env: NodeJS.ProcessEnv = process.env,
+  home = homedir(),
+): string {
+  return env.AGENTS_CODEX_HOME || env.CODEX_HOME || join(home, ".codex");
 }
