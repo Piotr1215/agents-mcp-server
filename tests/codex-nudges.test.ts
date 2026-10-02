@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  deliverBoundedCodexNudge,
   deliverCodexNudge,
   encodeClientTextFrame,
   readCodexBinding,
@@ -106,6 +107,132 @@ describe("deliverCodexNudge", () => {
     await expect(deliverCodexNudge(rpc, "thread-1", message)).rejects.toThrow(
       "thread/read returned no thread",
     );
+  });
+});
+
+describe("deliverBoundedCodexNudge", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+  });
+
+  function delayedRpc(responses: unknown[], delayMs: number) {
+    const pending = new Map<ReturnType<typeof setTimeout>, (error: Error) => void>();
+    return {
+      request: vi.fn((_method: string, _params: Record<string, unknown>) => new Promise((resolve, reject) => {
+        const response = responses.shift();
+        const timer = setTimeout(() => {
+          pending.delete(timer);
+          if (response instanceof Error) reject(response);
+          else resolve(response);
+        }, delayMs);
+        pending.set(timer, reject);
+      })),
+      close: vi.fn(() => {
+        for (const [timer, reject] of pending) {
+          clearTimeout(timer);
+          reject(new Error("app-server socket closed"));
+        }
+        pending.clear();
+      }),
+    };
+  }
+
+  it("closes a never-responding RPC at the delivery deadline", async () => {
+    const rpc = { request: vi.fn(() => new Promise(() => {})), close: vi.fn() };
+    const rejected = expect(deliverBoundedCodexNudge(rpc, "thread-1", message, 75))
+      .rejects.toThrow("Codex nudge delivery timed out after 75ms");
+
+    await vi.advanceTimersByTimeAsync(74);
+    expect(rpc.close).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await rejected;
+    expect(rpc.close).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("bounds read and start together even when each response is quick", async () => {
+    const rpc = delayedRpc([{ thread: { status: { type: "idle" }, turns: [] } }, {}], 40);
+    const rejected = expect(deliverBoundedCodexNudge(rpc, "thread-1", message, 60))
+      .rejects.toThrow("delivery timed out after 60ms");
+
+    await vi.advanceTimersByTimeAsync(60);
+    await rejected;
+    expect(rpc.request.mock.calls.map(([method]) => method)).toEqual(["thread/read", "turn/start"]);
+    expect(rpc.close).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps the original deadline through the steer retry", async () => {
+    const rpc = delayedRpc([
+      { thread: { status: { type: "active" }, turns: [{ id: "turn-1", status: "inProgress" }] } },
+      new Error("turn is no longer active"),
+      { thread: { status: { type: "idle" }, turns: [] } },
+      {},
+    ], 20);
+    const rejected = expect(deliverBoundedCodexNudge(rpc, "thread-1", message, 70))
+      .rejects.toThrow("delivery timed out after 70ms");
+
+    await vi.advanceTimersByTimeAsync(70);
+    await rejected;
+    expect(rpc.request.mock.calls.map(([method]) => method)).toEqual([
+      "thread/read", "turn/steer", "thread/read", "turn/start",
+    ]);
+    expect(rpc.close).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("clears the deadline after success without closing the bridge later", async () => {
+    const rpc = { ...rpcWithThread({ status: { type: "idle" }, turns: [] }), close: vi.fn() };
+
+    expect(await deliverBoundedCodexNudge(rpc, "thread-1", message, 75)).toBe("started");
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(150);
+    expect(rpc.close).not.toHaveBeenCalled();
+  });
+
+  it("propagates an RPC failure and clears the deadline", async () => {
+    const error = new Error("thread read failed");
+    const rpc = { request: vi.fn().mockRejectedValue(error), close: vi.fn() };
+
+    await expect(deliverBoundedCodexNudge(rpc, "thread-1", message, 75)).rejects.toBe(error);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(150);
+    expect(rpc.close).not.toHaveBeenCalled();
+  });
+
+  it("still rejects the deadline if closing the failed bridge throws", async () => {
+    const cause = new Error("close failed");
+    const rpc = {
+      request: vi.fn(() => new Promise(() => {})),
+      close: vi.fn(() => { throw cause; }),
+    };
+    const rejected = expect(deliverBoundedCodexNudge(rpc, "thread-1", message, 75))
+      .rejects.toMatchObject({ message: "Codex nudge delivery timed out after 75ms", cause });
+
+    await vi.advanceTimersByTimeAsync(75);
+    await rejected;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("uses the configured delivery deadline by default", async () => {
+    vi.stubEnv("AGENTS_CODEX_NUDGE_TIMEOUT_MS", "50");
+    const rpc = { request: vi.fn(() => new Promise(() => {})), close: vi.fn() };
+    const rejected = expect(deliverBoundedCodexNudge(rpc, "thread-1", message))
+      .rejects.toThrow("delivery timed out after 50ms");
+
+    await vi.advanceTimersByTimeAsync(50);
+    await rejected;
+    expect(rpc.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an invalid delivery budget before requesting or scheduling work", async () => {
+    const rpc = { request: vi.fn(), close: vi.fn() };
+
+    await expect(deliverBoundedCodexNudge(rpc, "thread-1", message, 0)).rejects.toThrow("positive finite number");
+    expect(rpc.request).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 

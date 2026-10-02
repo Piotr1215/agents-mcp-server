@@ -75,7 +75,20 @@ Published as a Docker image for shared deployments (homelab proving ground, loft
 piotrzan/agents-mcp-server:<version>
 ```
 
-The image bakes in no `AGENTS_*` defaults — callers (Kubernetes Deployment, `docker run -e …`) set `AGENTS_NATS_URL`, `AGENTS_TRANSPORT`, and `AGENTS_HTTP_PORT` explicitly. The server fails loud on missing NATS so misconfiguration is caught at boot.
+The image bakes in no `AGENTS_*` defaults. Set `AGENTS_NATS_URL` and `AGENTS_TRANSPORT=http` in the deployment. HTTP binds to `127.0.0.1` by default. A container or shared deployment must set `AGENTS_HTTP_HOST` and `AGENTS_HTTP_ALLOWED_HOSTS` explicitly. The server fails at boot if NATS is unreachable or a remote bind has no allowed Host list.
+
+Shared HTTP deployments require an authenticated TLS gateway. This server does not authenticate HTTP callers. The gateway must control access to the shared agent bus and preserve an allowed Host header. Configure the public hostname and any health probe hostnames in `AGENTS_HTTP_ALLOWED_HOSTS`:
+
+```bash
+AGENTS_TRANSPORT=http
+AGENTS_HTTP_HOST=0.0.0.0
+AGENTS_HTTP_PORT=3000
+AGENTS_HTTP_ALLOWED_HOSTS=agents-mcp.example.com,127.0.0.1
+```
+
+Each request checks Host and any present Origin before reading its body or creating an MCP session. An invalid, duplicate, or unlisted value returns 403. Host entries match exact names. An entry without a port permits any port for that name; `agents-mcp.example.com:443` permits only port 443. IPv6 entries use brackets, such as `[::1]:3000`.
+
+Native clients without an Origin header work with an allowed Host. Browser clients must set an explicit list of page origins, such as `AGENTS_HTTP_ALLOWED_ORIGINS=https://app.example.com`. Entries contain only an HTTP(S) scheme, host, and optional port. Wildcards, credentials, paths, queries, fragments, and `null` are rejected. This list does not add browser CORS headers or replace gateway authentication.
 
 Exposed endpoints:
 
@@ -90,7 +103,7 @@ Client config for Claude Code:
   "mcpServers": {
     "agents": {
       "type": "http",
-      "url": "http://agents-mcp.<your-host>/mcp"
+      "url": "https://agents-mcp.<your-host>/mcp"
     }
   }
 }
@@ -103,6 +116,10 @@ Client config for Claude Code:
 | `AGENTS_NATS_URL` | _(no default)_ | Required; server refuses to start if NATS is unreachable |
 | `AGENTS_TRANSPORT` | `stdio` (code default; no default in the Docker image) | `stdio` or `http` |
 | `AGENTS_HTTP_PORT` | `3000` (code default) | HTTP mode only |
+| `AGENTS_HTTP_HOST` | `127.0.0.1` | Bind address in HTTP mode; set explicitly for containers or remote access |
+| `AGENTS_HTTP_ALLOWED_HOSTS` | `localhost,127.0.0.1,[::1]` | Comma-separated exact Host names or `host:port` entries; required for a bind beyond loopback |
+| `AGENTS_HTTP_ALLOWED_ORIGINS` | _empty_ | Comma-separated HTTP(S) page origins; any present Origin is rejected unless listed |
+| `AGENTS_CODEX_NUDGE_TIMEOUT_MS` | `1000` | Positive finite deadline in ms for each socket setup/RPC and for the whole Codex delivery |
 | `AGENTS_HISTORY_MAX_AGE_MS` | `30d` | JetStream stream retention |
 | `AGENTS_HISTORY_MAX_BYTES` | `512 MiB` | JetStream stream cap |
 | `AGENTS_HISTORY_MAX_MSGS_PER_SUBJECT` | `10000` | Per-subject cap |
@@ -132,11 +149,15 @@ Only dependency is `AGENTS_NATS_URL`. `snd` talks NATS directly, so it works the
 
 In stdio mode the session is the process; in HTTP mode each connected client holds its own binding and SSE stream. Echo suppression happens at the handler: you never see your own outbound message pushed back at you.
 
-Sessions that haven't called `agent_register` yet stay send-only; inbound is still captured by the JetStream audit stream and available via `channel_history` / `dm_history` / `group_history` for catch-up reads.
+Register before sending messages or reading your DM/poll history. Those tools require the name bound to the calling session. Discovery and channel, group, and global history remain shared bus views.
+
+A registered name belongs to one local session. Another session cannot replace it or deregister it. The owner may change its group or rename; renaming, deregistration, and transport close release the old name. A reconnect must reuse its existing MCP session, close the old session, or choose a free name. Lost bound sessions are not automatically reclaimed; session liveness remains a separate follow-up.
+
+Codex delivery has a deadline for the whole nudge as well as socket setup and individual RPCs. A failed bridge closes and the next message can reconnect. One silent recipient cannot hold later NATS messages indefinitely.
 
 ## Tools
 
-All tools use `name` for identification (agents know their names from prompts). Every response includes `_meta: { chars, lines, ms }` for token awareness.
+Actor-specific tools retain the `name` argument and check it against the calling session's binding. A name or MCP session ID does not authenticate a user. Successful responses include text metrics named `_meta: { chars, lines, ms }`; moving them to protocol metadata is tracked in #49.
 
 ### agent_register
 
@@ -151,7 +172,7 @@ Register as an agent. Returns peers in your group.
 
 ### agent_deregister
 
-Unregister when done. Idempotent — succeeds even if already gone.
+Unregister your own binding when done. Repeating the call succeeds if the name is still free; it cannot remove a new owner.
 
 ```typescript
 { name: "researcher" }
@@ -307,7 +328,10 @@ Docker image:
 
 ```bash
 docker build -t agents-mcp-server:dev .
-docker run --rm -e AGENTS_NATS_URL=nats://host.docker.internal:4222 -p 3000:3000 agents-mcp-server:dev
+docker run --rm -e AGENTS_NATS_URL=nats://host.docker.internal:4222 \
+  -e AGENTS_TRANSPORT=http -e AGENTS_HTTP_HOST=0.0.0.0 \
+  -e AGENTS_HTTP_ALLOWED_HOSTS=localhost,127.0.0.1 \
+  -p 127.0.0.1:3000:3000 agents-mcp-server:dev
 curl http://localhost:3000/health
 ```
 

@@ -21,9 +21,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "crypto";
-import { createServer, IncomingMessage, ServerResponse } from "http";
+import { createServer, IncomingMessage, ServerResponse, Server } from "http";
 import { z } from "zod";
-import { appendFileSync } from "fs";
+import { appendFileSync, realpathSync } from "fs";
+import { fileURLToPath } from "url";
 import * as registry from "./registry.js";
 import * as history from "./history.js";
 import { initNatsTransport, NatsTransport } from "./nats.js";
@@ -41,9 +42,11 @@ import {
 } from "./validation.js";
 import {
   CodexAppServerSocket,
-  deliverCodexNudge,
+  deliverBoundedCodexNudge,
   readCodexBinding,
+  resolveCodexNudgeTimeoutMs,
 } from "./codex-nudges.js";
+import { readHttpSecurityPolicy, validateHttpRequest, type HttpSecurityPolicy } from "./http-security.js";
 
 const SERVER_NAME = "agents";
 const SERVER_VERSION = "5.1.1";
@@ -52,7 +55,21 @@ const LOG_FILE = process.env.AGENTS_LOG_FILE || "";
 
 let natsTransport: NatsTransport | null = null;
 
-interface SessionBinding { name: string; group: string; agentId: string; }
+export interface SessionBinding { name: string; group: string; agentId: string; }
+
+interface BindingOwner {
+  getBinding: () => SessionBinding | null;
+  setBinding: (b: SessionBinding | null) => void;
+}
+
+// Tool-supplied names are actor labels. Only the session that claimed a local
+// name may use it. Endpoint authentication belongs at the HTTP gateway.
+const agentOwners = new Map<string, BindingOwner>();
+
+export type AgentTransport = Pick<NatsTransport,
+  "getHost" | "trackLocal" | "untrackLocal" | "publishBeat" | "getRemotePeers" |
+  "publishBroadcast" | "publishDirectMessage" | "publishChannelMessage"
+>;
 
 interface Session {
   id: string;
@@ -66,6 +83,25 @@ interface Session {
 }
 
 const sessions = new Map<string, Session>();
+
+function closeCodexBridge(session: Session | undefined): void {
+  if (!session) return;
+  session.codexBridge?.close();
+  session.codexBridge = undefined;
+  session.codexBridgeSocket = undefined;
+}
+
+// Both transports release delivery resources when their actor changes or leaves.
+function createBinding(getSession: () => Session | undefined): BindingOwner {
+  let binding: SessionBinding | null = null;
+  return {
+    getBinding: () => binding,
+    setBinding: (next) => {
+      if (binding?.agentId !== next?.agentId) closeCodexBridge(getSession());
+      binding = next;
+    },
+  };
+}
 
 // Tunables for HTTP-mode session housekeeping. Defaults err on the side of
 // dropping unbound sessions quickly (clients that initialize but never call
@@ -104,7 +140,11 @@ async function withMeta(
   return { content: [{ type: "text", text: finalResult }] };
 }
 
-function createMcpServer(session: { getBinding: () => SessionBinding | null; setBinding: (b: SessionBinding | null) => void }): McpServer {
+export function createMcpServer(
+  session: BindingOwner,
+  transport: AgentTransport | null = natsTransport,
+): McpServer {
+  const natsTransport = transport;
   const server = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
     {
@@ -115,6 +155,31 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       instructions: "Multi-agent coordination server with live session push. agent_register(name, description, group) both joins and binds this session — from that moment on, DMs to this name and broadcasts to this group push in as <channel source=\"agents\" kind=\"dm|broadcast|channel\">body</channel> tags. Use agent_broadcast, agent_dm, channel_send for outbound. Use *_history tools for catch-up reads. Deregister on shutdown.",
     },
   );
+
+  function requireOwner(name: string): registry.Agent {
+    const binding = session.getBinding();
+    if (!binding || binding.name !== name || agentOwners.get(name) !== session) {
+      throw new Error(`This session does not own '${name}'. Call agent_register with a free name and use that name.`);
+    }
+    const agent = registry.getAgent(binding.agentId);
+    if (!agent || agent.name !== name) {
+      throw new Error(`Your registration for '${name}' is gone. Call agent_register again.`);
+    }
+    return agent;
+  }
+
+  function releaseBinding(): void {
+    const binding = session.getBinding();
+    if (!binding) return;
+    if (agentOwners.get(binding.name) === session) {
+      agentOwners.delete(binding.name);
+      registry.deregisterAgent(binding.agentId);
+      natsTransport?.untrackLocal(binding.agentId);
+    }
+    session.setBinding(null);
+  }
+
+  server.server.onclose = releaseBinding;
 
   server.registerTool(
     "agent_register",
@@ -133,22 +198,13 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       const host = natsTransport?.getHost() ?? "local";
       const agentId = registry.generateAgentId(name, host);
 
-      // Evict any other session that previously bound this name. Without
-      // this, a stale session left over from a /mcp reconnect (or a crashed
-      // client whose transport.onclose never fired) keeps a dead binding
-      // for the same name. pushToSessions then fans out notifications to
-      // both — the live session and the dead transport — and the dead one
-      // can stall the await chain. One name, one bound session.
-      for (const s of sessions.values()) {
-        if (s.setBinding === session.setBinding) continue;
-        const b = s.getBinding();
-        if (b && b.name === name) {
-          s.setBinding(null);
-          registry.deregisterAgent(b.agentId);
-          if (natsTransport) natsTransport.untrackLocal(b.agentId);
-        }
+      const owner = agentOwners.get(name);
+      if ((owner && owner !== session) || (registry.getAgentByName(name) && owner !== session)) {
+        throw new Error(`Agent '${name}' is owned by another session. Use a free name or close the owning session first.`);
       }
-
+      const previous = session.getBinding();
+      if (previous && previous.name !== name) releaseBinding();
+      agentOwners.set(name, session);
       registry.registerAgent(agentId, name, groupName);
 
       const peers = registry
@@ -186,10 +242,8 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       if (!agent) {
         return JSON.stringify({ success: true, name, message: "was already gone or never registered" });
       }
-      registry.deregisterAgent(agent.id);
-      if (natsTransport) natsTransport.untrackLocal(agent.id);
-      const binding = session.getBinding();
-      if (binding && binding.agentId === agent.id) session.setBinding(null);
+      requireOwner(name);
+      releaseBinding();
       return JSON.stringify({
         success: true,
         id: agent.id,
@@ -214,8 +268,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       annotations: { readOnlyHint: false },
     },
     async ({ name, message, group }) => withMeta(async () => {
-      const sender = registry.getAgentByName(name);
-      if (!sender) return `Error: You (${name}) not registered. Call agent_register first.`;
+      const sender = requireOwner(name);
       const bodyErr = validateMessageBody(message);
       if (bodyErr) return `Error: broadcast ${bodyErr}.`;
       if (!natsTransport) return `Error: NATS transport not configured — broadcasts require AGENTS_NATS_URL.`;
@@ -248,8 +301,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       annotations: { readOnlyHint: false },
     },
     async ({ name, to, message }) => withMeta(async () => {
-      const sender = registry.getAgentByName(name);
-      if (!sender) return `Error: You (${name}) not registered. Call agent_register first.`;
+      requireOwner(name);
       if (!natsTransport) return `Error: NATS transport not configured — DMs require AGENTS_NATS_URL.`;
 
       const bodyErr = validateMessageBody(message);
@@ -325,6 +377,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       annotations: { readOnlyHint: false },
     },
     async ({ name, channel, message }) => withMeta(async () => {
+      requireOwner(name);
       if (!natsTransport) return `Error: NATS transport not configured — channels require AGENTS_NATS_URL.`;
       logToFile("CHANNEL", `#${channel} ${name}: ${message}`);
       natsTransport.publishChannelMessage(channel, name, message);
@@ -382,6 +435,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       annotations: { readOnlyHint: true },
     },
     async ({ name, with_agent, limit, detailed }) => withMeta(async () => {
+      requireOwner(name);
       const messages = await history.getDmHistory(name, with_agent, limit);
       if (messages.length === 0) return `No DM history with ${with_agent}`;
       if (detailed) {
@@ -476,8 +530,7 @@ function createMcpServer(session: { getBinding: () => SessionBinding | null; set
       annotations: { readOnlyHint: true },
     },
     async ({ name, since_id }) => withMeta(async () => {
-      const agent = registry.getAgentByName(name);
-      if (!agent) return `Error: Agent '${name}' not registered. Call agent_register first.`;
+      const agent = requireOwner(name);
       const messages = await history.getMessagesForAgent(name, agent.group_name, since_id || 0);
       if (messages.length === 0) return JSON.stringify({ messages: [], last_id: since_id || 0 });
       const lastId = messages[messages.length - 1].id;
@@ -517,12 +570,13 @@ async function pushOne(session: Session, params: Record<string, unknown>): Promi
 // the target. Own-sends are suppressed at the binding layer: the sender's
 // session sees the tool response, not an echoed <channel> tag. Pushes run in
 // parallel — serial await behind a dead transport was the stall.
-async function pushToSessions(
+export async function pushToSessions(
   kind: "channel" | "dm" | "broadcast",
   msg: { fromAgent: string; originHost: string; channel?: string; toAgent?: string; group?: string; content: string; originTs: number; originSeq: number },
+  transport: Pick<AgentTransport, "getHost"> | null = natsTransport,
 ): Promise<void> {
-  if (!natsTransport) return;
-  const senderHost = natsTransport.getHost();
+  if (!transport) return;
+  const senderHost = transport.getHost();
   const tasks: Promise<void>[] = [];
   for (const session of sessions.values()) {
     const binding = session.getBinding();
@@ -565,13 +619,14 @@ async function pushToSessions(
       : readCodexBinding(binding.name);
     if (codexBinding) {
       const socketPath = codexBinding.socketPath ?? "";
-      if (!session.codexBridge || session.codexBridgeSocket !== socketPath) {
+      if (!session.codexBridge || session.codexBridge.closed || session.codexBridgeSocket !== socketPath) {
         session.codexBridge?.close();
         session.codexBridge = new CodexAppServerSocket(codexBinding.socketPath);
         session.codexBridgeSocket = socketPath;
       }
+      const bridge = session.codexBridge;
       tasks.push(
-        deliverCodexNudge(session.codexBridge, codexBinding.threadId, {
+        deliverBoundedCodexNudge(bridge, codexBinding.threadId, {
           fromAgent: msg.fromAgent,
           content: msg.content,
           originHost: msg.originHost,
@@ -579,6 +634,11 @@ async function pushToSessions(
           ...(kind === "broadcast" ? { group: msg.group } : {}),
           ...(kind === "channel" ? { channel: msg.channel } : {}),
         }).then(() => undefined).catch((err) => {
+          if (session.codexBridge === bridge) {
+            closeCodexBridge(session);
+          } else {
+            bridge.close();
+          }
           console.error("[codex-nudge] delivery failed:", err instanceof Error ? err.message : err);
         }),
       );
@@ -620,10 +680,9 @@ async function initInfra(): Promise<void> {
 
 async function startStdio(): Promise<void> {
   const transport = new StdioServerTransport();
-  let binding: SessionBinding | null = null;
-  const getBinding = () => binding;
-  const setBinding = (b: SessionBinding | null) => { binding = b; };
-  const session: Session = {
+  let session: Session;
+  const { getBinding, setBinding } = createBinding(() => session);
+  session = {
     id: "stdio",
     server: createMcpServer({ getBinding, setBinding }),
     transport,
@@ -632,14 +691,28 @@ async function startStdio(): Promise<void> {
     lastActivity: Date.now(),
   };
   sessions.set(session.id, session);
+  transport.onclose = () => {
+    sessions.delete(session.id);
+    closeCodexBridge(session);
+  };
   await session.server.connect(transport);
   console.error(`agents MCP v${SERVER_VERSION} (stdio + NATS@${natsTransport?.getHost()}) running`);
 }
 
-async function startHttp(): Promise<void> {
-  const port = Number(process.env.AGENTS_HTTP_PORT) || 3000;
+export function createHttpServer(
+  transport: AgentTransport | null = natsTransport,
+  policy: HttpSecurityPolicy = readHttpSecurityPolicy(),
+): Server {
+  const ownedSessions = new Set<Session>();
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    let createdSession: Session | undefined;
     try {
+      const denial = validateHttpRequest(req, policy);
+      if (denial) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: denial }));
+        return;
+      }
       if (req.method === "GET" && req.url === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "ok", version: SERVER_VERSION, sessions: sessions.size }));
@@ -653,7 +726,9 @@ async function startHttp(): Promise<void> {
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
       let session = sessionId ? sessions.get(sessionId) : undefined;
       if (!session && body && isInitializeRequest(body)) {
-        session = await createHttpSession();
+        session = await createHttpSession(transport, policy, (closed) => ownedSessions.delete(closed));
+        createdSession = session;
+        ownedSessions.add(session);
       }
       if (!session) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -668,10 +743,25 @@ async function startHttp(): Promise<void> {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: String(err instanceof Error ? err.message : err) }));
       }
+    } finally {
+      // The SDK can reject Accept/content-type before initialization. Such a
+      // transport has no session ID and cannot be reached by the idle sweeper.
+      if (createdSession && !createdSession.id) await createdSession.server.close();
     }
   });
-  httpServer.listen(port, () => {
-    console.error(`agents MCP v${SERVER_VERSION} (streamable-http:${port} + NATS@${natsTransport?.getHost()}) running`);
+  httpServer.on("close", () => {
+    for (const session of ownedSessions) void session.server.close();
+    ownedSessions.clear();
+  });
+  return httpServer;
+}
+
+async function startHttp(): Promise<void> {
+  const port = Number(process.env.AGENTS_HTTP_PORT) || 3000;
+  const policy = readHttpSecurityPolicy();
+  const httpServer = createHttpServer(natsTransport, policy);
+  httpServer.listen(port, policy.host, () => {
+    console.error(`agents MCP v${SERVER_VERSION} (streamable-http:${policy.host}:${port} + NATS@${natsTransport?.getHost()}) running`);
   });
 
   // Sweep unbound HTTP sessions whose transport.onclose never fired (laptop
@@ -706,30 +796,31 @@ function readBody(req: IncomingMessage): Promise<unknown> {
   });
 }
 
-async function createHttpSession(): Promise<Session> {
-  let binding: SessionBinding | null = null;
-  const getBinding = () => binding;
-  const setBinding = (b: SessionBinding | null) => { binding = b; };
+async function createHttpSession(
+  transportSource: AgentTransport | null,
+  policy: HttpSecurityPolicy,
+  onClose: (session: Session) => void,
+): Promise<Session> {
+  let session: Session;
+  const { getBinding, setBinding } = createBinding(() => session);
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
+    enableDnsRebindingProtection: true,
+    allowedOrigins: [...policy.allowedOrigins],
+    // The router checks Host on every request before parsing. SDK v1's exact
+    // Host strings cannot express a hostname allowed at any listening port.
     onsessioninitialized: (id: string) => {
-      const s = pending;
-      if (!s) return;
-      s.id = id;
-      sessions.set(id, s);
+      session.id = id;
+      sessions.set(id, session);
     },
   });
-  const server = createMcpServer({ getBinding, setBinding });
+  const server = createMcpServer({ getBinding, setBinding }, transportSource);
   transport.onclose = () => {
     if (transport.sessionId) sessions.delete(transport.sessionId);
-    const agentId = binding?.agentId;
-    if (agentId) {
-      registry.deregisterAgent(agentId);
-      if (natsTransport) natsTransport.untrackLocal(agentId);
-    }
+    closeCodexBridge(session);
+    onClose(session);
   };
-  await server.connect(transport);
-  const session: Session = {
+  session = {
     id: "",
     server,
     transport,
@@ -737,18 +828,16 @@ async function createHttpSession(): Promise<Session> {
     setBinding,
     lastActivity: Date.now(),
   };
-  pending = session;
+  await server.connect(transport);
   return session;
 }
 
-// Bridge for the onsessioninitialized callback — the StreamableHTTP transport
-// does not pass the session object back to us, so we stash the in-flight one
-// here between construction and the init callback.
-let pending: Session | null = null;
-
 async function main(): Promise<void> {
-  await initInfra();
   const transportMode = (process.env.AGENTS_TRANSPORT || "stdio").toLowerCase();
+  // Reject invalid boundary settings before opening infrastructure connections.
+  if (transportMode === "http") readHttpSecurityPolicy();
+  if (process.env.AGENTS_CODEX_NUDGES !== "0") resolveCodexNudgeTimeoutMs();
+  await initInfra();
   if (transportMode === "http") {
     await startHttp();
   } else {
@@ -756,10 +845,19 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error("[fatal]", err);
-  process.exit(1);
-});
+// Importing the server factories must not connect to the shared bus. Resolve
+// argv's symlink so the published CLI and npm-linked installs still start.
+function isEntrypoint(): boolean {
+  if (!process.argv[1]) return false;
+  try { return realpathSync(process.argv[1]) === fileURLToPath(import.meta.url); }
+  catch { return false; }
+}
 
-process.on("SIGTERM", async () => { await natsTransport?.close(); process.exit(0); });
-process.on("SIGINT", async () => { await natsTransport?.close(); process.exit(0); });
+if (isEntrypoint()) {
+  main().catch((err) => {
+    console.error("[fatal]", err);
+    process.exit(1);
+  });
+  process.on("SIGTERM", async () => { await natsTransport?.close(); process.exit(0); });
+  process.on("SIGINT", async () => { await natsTransport?.close(); process.exit(0); });
+}

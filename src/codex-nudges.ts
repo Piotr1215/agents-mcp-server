@@ -81,6 +81,32 @@ export async function deliverCodexNudge(
   }
 }
 
+export async function deliverBoundedCodexNudge(
+  rpc: AppServerRpc & { close(): void },
+  threadId: string,
+  message: CodexNudge,
+  timeoutMs = resolveCodexNudgeTimeoutMs(),
+): Promise<DeliveryResult> {
+  validateTimeoutMs(timeoutMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`Codex nudge delivery timed out after ${timeoutMs}ms`);
+      try {
+        rpc.close();
+      } catch (cause) {
+        error.cause = cause;
+      }
+      reject(error);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([deliverCodexNudge(rpc, threadId, message), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function encodeClientTextFrame(text: string, mask = randomBytes(4)): Buffer {
   return encodeClientFrame(Buffer.from(text), 0x1, mask);
 }
@@ -138,26 +164,56 @@ function encodeClientFrame(payload: Buffer, opcode: number, mask = randomBytes(4
 
 export class CodexAppServerSocket implements AppServerRpc {
   private readonly socket: Socket;
+  private readonly timeoutMs: number;
   private readonly pending = new Map<number, {
     resolve: (value: unknown) => void;
     reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
   }>();
   private readonly connected: Promise<void>;
   private readonly initialized: Promise<void>;
+  private abortHandshake?: (error: Error) => void;
+  private terminalError?: Error;
   private buffer = Buffer.alloc(0);
   private handshakeDone = false;
   private nextId = 1;
+  private readonly onSocketError = (error: Error) => this.fail(error);
+  private readonly onSocketClose = () => {
+    this.fail(new Error("app-server socket closed"));
+    this.socket.off("error", this.onSocketError);
+  };
+  private readonly onSocketData = (chunk: Buffer) => {
+    try {
+      this.handleData(chunk);
+    } catch (error) {
+      this.fail(error instanceof Error ? error : new Error(String(error)));
+    }
+  };
 
-  constructor(socketPath = resolveCodexSocketPath()) {
+  constructor(socketPath = resolveCodexSocketPath(), options: { timeoutMs?: number } = {}) {
+    this.timeoutMs = options.timeoutMs === undefined
+      ? resolveCodexNudgeTimeoutMs()
+      : validateTimeoutMs(options.timeoutMs);
     this.socket = createConnection(socketPath);
+    this.socket.on("error", this.onSocketError);
+    this.socket.once("close", this.onSocketClose);
     this.connected = this.handshake();
-    this.socket.on("error", (error) => this.rejectPending(error));
-    this.socket.on("close", () => this.rejectPending(new Error("app-server socket closed")));
     this.initialized = this.connected
       .then(() => this.requestRaw("initialize", {
         clientInfo: { name: "agents_nudge_bridge", title: "Agents Nudge Bridge", version: "1.0.0" },
       }))
-      .then(() => this.notify("initialized", {}));
+      .then(() => this.notify("initialized", {}))
+      .catch((error: Error) => {
+        this.fail(error);
+        throw error;
+      });
+    // The bridge may fail before its first request. Keep the original rejection
+    // for request() while marking the eager initialization promise as handled.
+    void this.initialized.catch(() => {});
+  }
+
+  get closed(): boolean {
+    return this.terminalError !== undefined;
   }
 
   async request(method: string, params: Record<string, unknown>): Promise<unknown> {
@@ -166,7 +222,7 @@ export class CodexAppServerSocket implements AppServerRpc {
   }
 
   close(): void {
-    this.socket.end(encodeClientFrame(Buffer.alloc(0), 0x8));
+    this.fail(new Error("app-server socket closed"));
   }
 
   private handshake(): Promise<void> {
@@ -175,7 +231,13 @@ export class CodexAppServerSocket implements AppServerRpc {
       .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
       .digest("base64");
     return new Promise((resolve, reject) => {
-      this.socket.once("connect", () => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.socket.off("connect", onConnect);
+        this.socket.off("data", onHandshake);
+        this.abortHandshake = undefined;
+      };
+      const onConnect = () => {
         this.socket.write([
           "GET / HTTP/1.1",
           "Host: localhost",
@@ -186,7 +248,7 @@ export class CodexAppServerSocket implements AppServerRpc {
           "",
           "",
         ].join("\r\n"));
-      });
+      };
       const onHandshake = (chunk: Buffer) => {
         this.buffer = Buffer.concat([this.buffer, chunk]);
         const end = this.buffer.indexOf("\r\n\r\n");
@@ -196,29 +258,45 @@ export class CodexAppServerSocket implements AppServerRpc {
         const accepted = headers.toLowerCase().includes("101 switching protocols")
           && headers.toLowerCase().includes(`sec-websocket-accept: ${expected.toLowerCase()}`);
         if (!accepted) {
-          reject(new Error(`app-server WebSocket handshake failed: ${headers.split("\r\n")[0]}`));
+          this.fail(new Error(`app-server WebSocket handshake failed: ${headers.split("\r\n")[0]}`));
           return;
         }
         this.handshakeDone = true;
-        this.socket.off("data", onHandshake);
-        this.socket.on("data", (data: Buffer) => this.handleData(data));
-        if (this.buffer.length > 0) this.consumeFrames();
+        cleanup();
+        this.socket.on("data", this.onSocketData);
+        if (this.buffer.length > 0) this.onSocketData(Buffer.alloc(0));
         resolve();
       };
+      const timer = setTimeout(() => {
+        this.fail(new Error(`app-server WebSocket handshake timed out after ${this.timeoutMs}ms`));
+      }, this.timeoutMs);
+      this.abortHandshake = (error) => {
+        cleanup();
+        reject(error);
+      };
+      this.socket.once("connect", onConnect);
       this.socket.on("data", onHandshake);
-      this.socket.once("error", reject);
     });
   }
 
   private requestRaw(method: string, params: Record<string, unknown>): Promise<unknown> {
+    if (this.terminalError) return Promise.reject(this.terminalError);
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.socket.write(encodeClientTextFrame(JSON.stringify({ method, id, params })));
+      const timer = setTimeout(() => {
+        this.fail(new Error(`app-server ${method} timed out after ${this.timeoutMs}ms`));
+      }, this.timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
+      try {
+        this.socket.write(encodeClientTextFrame(JSON.stringify({ method, id, params })));
+      } catch (error) {
+        this.fail(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
   private notify(method: string, params: Record<string, unknown>): void {
+    if (this.terminalError) throw this.terminalError;
     this.socket.write(encodeClientTextFrame(JSON.stringify({ method, params })));
   }
 
@@ -254,7 +332,7 @@ export class CodexAppServerSocket implements AppServerRpc {
       if (mask) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
 
       if (opcode === 0x1) this.handleMessage(payload.toString("utf8"));
-      else if (opcode === 0x8) this.socket.end();
+      else if (opcode === 0x8) this.fail(new Error("app-server socket closed"));
       else if (opcode === 0x9) this.socket.write(encodeClientFrame(payload, 0xa));
     }
   }
@@ -270,14 +348,37 @@ export class CodexAppServerSocket implements AppServerRpc {
     const pending = this.pending.get(message.id);
     if (!pending) return;
     this.pending.delete(message.id);
+    clearTimeout(pending.timer);
     if (message.error) pending.reject(new Error(message.error.message || "app-server request failed"));
     else pending.resolve(message.result);
   }
 
-  private rejectPending(error: Error): void {
-    for (const pending of this.pending.values()) pending.reject(error);
+  private fail(error: Error): void {
+    if (this.terminalError) return;
+    this.terminalError = error;
+    this.abortHandshake?.(error);
+    this.socket.off("data", this.onSocketData);
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
     this.pending.clear();
+    this.buffer = Buffer.alloc(0);
+    this.socket.destroy();
   }
+}
+
+function validateTimeoutMs(timeoutMs: number): number {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("AGENTS_CODEX_NUDGE_TIMEOUT_MS must be a positive finite number");
+  }
+  return timeoutMs;
+}
+
+export function resolveCodexNudgeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return validateTimeoutMs(env.AGENTS_CODEX_NUDGE_TIMEOUT_MS === undefined
+    ? 1000
+    : Number(env.AGENTS_CODEX_NUDGE_TIMEOUT_MS));
 }
 
 export function resolveCodexSocketPath(
