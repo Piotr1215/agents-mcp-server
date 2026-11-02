@@ -121,6 +121,60 @@ describe("MCP session ownership", () => {
     expect(history.getMessagesForAgent).toHaveBeenCalledWith("alice", "updated", 0);
   });
 
+  it("queues a DM for an unregistered recipient and replays it once through poll_messages", async () => {
+    const storedMessages: Array<{
+      id: number;
+      type: "DM";
+      from_agent: string;
+      to_agent: string;
+      channel: null;
+      content: string;
+      origin_host: string;
+      timestamp: Date;
+    }> = [];
+    const transport = fakeTransport();
+    vi.mocked(transport.publishDirectMessage).mockImplementation((to, from, content) => {
+      storedMessages.push({
+        id: 1,
+        type: "DM",
+        from_agent: from,
+        to_agent: to,
+        channel: null,
+        content,
+        origin_host: "test-local",
+        timestamp: new Date(1),
+      });
+    });
+    vi.mocked(history.getMessagesForAgent).mockImplementation(async (name, _group, sinceId) =>
+      storedMessages.filter((message) => message.to_agent === name && message.id > sinceId),
+    );
+    const alice = await caller(transport);
+    const worker = await caller(transport);
+    await alice.register("alice");
+
+    const send = await alice.call("agent_dm", {
+      name: "alice", to: "worker", message: "finished",
+    });
+    expect(send.isError).not.toBe(true);
+    expect(send.content[0]).toMatchObject({ type: "text" });
+    expect((send.content[0] as { text: string }).text).toContain("queued for worker (not registered)");
+    expect(transport.publishDirectMessage).toHaveBeenCalledTimes(1);
+    expect(transport.publishDirectMessage).toHaveBeenCalledWith("worker", "alice", "finished");
+    expect(registry.getAgentByName("worker")).toBeNull();
+
+    await worker.register("worker");
+    const firstPoll = await worker.call("poll_messages", { name: "worker" });
+    const firstPayload = JSON.parse((firstPoll.content[0] as { text: string }).text);
+    expect(firstPayload).toMatchObject({
+      messages: [{ id: 1, type: "DM", from: "alice", content: "finished" }],
+      last_id: 1,
+    });
+
+    const secondPoll = await worker.call("poll_messages", { name: "worker", since_id: firstPayload.last_id });
+    expect(JSON.parse((secondPoll.content[0] as { text: string }).text)).toMatchObject({ messages: [], last_id: 1 });
+    expect(transport.publishDirectMessage).toHaveBeenCalledTimes(1);
+  });
+
   it("releases the previous name when the owner renames", async () => {
     const transport = fakeTransport();
     const alice = await caller(transport);

@@ -270,6 +270,12 @@ export class NatsTransport {
     this.channelSub = null;
     this.dmSub = null;
     this.broadcastSub = null;
+    // Closing the connection ends its status iterator. Waiting for that
+    // iterator before draining would hang cleanup after a failed history init.
+    if (this.nc) {
+      await this.nc.drain().catch(() => { /* best-effort */ });
+      this.nc = null;
+    }
     for (const loop of [this.presenceLoop, this.channelLoop, this.dmLoop, this.broadcastLoop, this.statusLoop]) {
       if (loop) { try { await loop; } catch { /* drained */ } }
     }
@@ -278,10 +284,6 @@ export class NatsTransport {
     this.dmLoop = null;
     this.broadcastLoop = null;
     this.statusLoop = null;
-    if (this.nc) {
-      await this.nc.drain().catch(() => { /* best-effort */ });
-      this.nc = null;
-    }
   }
 
   // Visible for tests.

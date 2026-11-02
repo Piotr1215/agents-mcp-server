@@ -55,9 +55,7 @@ export async function init(connection: NatsConnection): Promise<void> {
   } catch (err: unknown) {
     const code = (err as { code?: string })?.code;
     if (code === "STREAM_NAME_IN_USE" || code === "10058" || /already in use/i.test(String(err))) {
-      await jsm.streams.update(STREAM_NAME, config as never).catch((updErr) => {
-        console.error("[history] stream update failed:", updErr);
-      });
+      await jsm.streams.update(STREAM_NAME, config as never);
     } else {
       throw err;
     }

@@ -142,9 +142,16 @@ async function withMeta(
 
 export function createMcpServer(
   session: BindingOwner,
-  transport: AgentTransport | null = natsTransport,
+  transport: AgentTransport | null | (() => AgentTransport | null) = () => natsTransport,
 ): McpServer {
-  const natsTransport = transport;
+  let natsTransport = typeof transport === "function" ? transport() : transport;
+  const withReady = (fn: () => Promise<string>) => withMeta(() => {
+    if (typeof transport === "function") {
+      natsTransport = transport();
+      if (!natsTransport) return Promise.resolve("Error: bus connecting, retry.");
+    }
+    return fn();
+  });
   const server = new McpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
     {
@@ -193,7 +200,7 @@ export function createMcpServer(
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ name, group }) => withMeta(async () => {
+    async ({ name, group }) => withReady(async () => {
       const groupName = group || "default";
       const host = natsTransport?.getHost() ?? "local";
       const agentId = registry.generateAgentId(name, host);
@@ -237,7 +244,7 @@ export function createMcpServer(
       inputSchema: { name: z.string().describe("Your agent name") },
       annotations: { destructiveHint: true },
     },
-    async ({ name }) => withMeta(async () => {
+    async ({ name }) => withReady(async () => {
       const agent = registry.getAgentByName(name);
       if (!agent) {
         return JSON.stringify({ success: true, name, message: "was already gone or never registered" });
@@ -267,7 +274,7 @@ export function createMcpServer(
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ name, message, group }) => withMeta(async () => {
+    async ({ name, message, group }) => withReady(async () => {
       const sender = requireOwner(name);
       const bodyErr = validateMessageBody(message);
       if (bodyErr) return `Error: broadcast ${bodyErr}.`;
@@ -300,7 +307,7 @@ export function createMcpServer(
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ name, to, message }) => withMeta(async () => {
+    async ({ name, to, message }) => withReady(async () => {
       requireOwner(name);
       if (!natsTransport) return `Error: NATS transport not configured — DMs require AGENTS_NATS_URL.`;
 
@@ -313,10 +320,9 @@ export function createMcpServer(
         hasLocalAgent: () => !!registry.getAgentByName(to),
         hasRemotePeer: (n) => natsTransport!.getRemotePeers().some((p) => p.name === n),
       });
-      if (!reachable) return `Error: agent '${to}' not registered. Use agent_discover to see active agents.`;
-
       logToFile("DM", `${name} -> ${to}: ${message}`);
       natsTransport.publishDirectMessage(to, name, message);
+      if (!reachable) return `queued for ${to} (not registered)`;
       return `DM published to '${to}' over NATS. Live delivery happens when the recipient session is registered (agent_register auto-binds); otherwise the message stays in dm_history for catch-up.`;
     }),
   );
@@ -332,7 +338,7 @@ export function createMcpServer(
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ group }) => withMeta(async () => {
+    async ({ group }) => withReady(async () => {
       const agents = registry.getAgents(group || undefined);
       if (agents.length === 0) {
         return group ? `No agents in group '${group}'` : "No agents currently registered.";
@@ -356,7 +362,7 @@ export function createMcpServer(
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },
-    async () => withMeta(async () => {
+    async () => withReady(async () => {
       const groups = registry.getGroups();
       if (groups.length === 0) return "No agents registered.";
       const lines = groups.map((g) => `- ${g.group_name} (${g.count} agent${g.count > 1 ? "s" : ""})`);
@@ -376,7 +382,7 @@ export function createMcpServer(
       },
       annotations: { readOnlyHint: false },
     },
-    async ({ name, channel, message }) => withMeta(async () => {
+    async ({ name, channel, message }) => withReady(async () => {
       requireOwner(name);
       if (!natsTransport) return `Error: NATS transport not configured — channels require AGENTS_NATS_URL.`;
       logToFile("CHANNEL", `#${channel} ${name}: ${message}`);
@@ -397,7 +403,7 @@ export function createMcpServer(
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ channel, limit, detailed }) => withMeta(async () => {
+    async ({ channel, limit, detailed }) => withReady(async () => {
       const messages = await history.getChannelHistory(channel, limit);
       if (messages.length === 0) return `No messages in #${channel}`;
       if (detailed) {
@@ -434,7 +440,7 @@ export function createMcpServer(
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ name, with_agent, limit, detailed }) => withMeta(async () => {
+    async ({ name, with_agent, limit, detailed }) => withReady(async () => {
       requireOwner(name);
       const messages = await history.getDmHistory(name, with_agent, limit);
       if (messages.length === 0) return `No DM history with ${with_agent}`;
@@ -468,7 +474,7 @@ export function createMcpServer(
       inputSchema: {},
       annotations: { readOnlyHint: true },
     },
-    async () => withMeta(async () => {
+    async () => withReady(async () => {
       const channels = await history.getChannels();
       if (channels.length === 0) return "No channels with messages yet.";
       const lines = channels.map((c) => `- #${c.channel} (${c.message_count} messages)`);
@@ -487,7 +493,7 @@ export function createMcpServer(
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ group, limit }) => withMeta(async () => {
+    async ({ group, limit }) => withReady(async () => {
       const messages = await history.getGroupHistory(group, limit);
       if (messages.length === 0) return `No history for group '${group}'`;
       const lines = messages.map((m) => {
@@ -510,7 +516,7 @@ export function createMcpServer(
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ since_id, limit }) => withMeta(async () => {
+    async ({ since_id, limit }) => withReady(async () => {
       const messages = await history.getMessagesSince(since_id || 0, limit);
       if (messages.length === 0) return JSON.stringify({ messages: [], last_id: since_id || 0 });
       const lastId = messages[messages.length - 1].id;
@@ -529,7 +535,7 @@ export function createMcpServer(
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ name, since_id }) => withMeta(async () => {
+    async ({ name, since_id }) => withReady(async () => {
       const agent = requireOwner(name);
       const messages = await history.getMessagesForAgent(name, agent.group_name, since_id || 0);
       if (messages.length === 0) return JSON.stringify({ messages: [], last_id: since_id || 0 });
@@ -654,7 +660,7 @@ export async function pushToSessions(
 
 async function initInfra(): Promise<void> {
   const natsUrl = process.env.AGENTS_NATS_URL || DEFAULT_NATS_URL;
-  natsTransport = await initNatsTransport({
+  const transport = await initNatsTransport({
     url: natsUrl,
     onChannelMessage: async (msg) => {
       logToFile("CHANNEL", `#${msg.channel} ${msg.fromAgent}@${msg.originHost}: ${msg.content}`);
@@ -669,13 +675,33 @@ async function initInfra(): Promise<void> {
       await pushToSessions("broadcast", msg);
     },
   });
-  if (!natsTransport) {
+  if (!transport) {
     throw new Error(`Failed to connect to NATS at ${natsUrl}. Set AGENTS_NATS_URL or ensure the default is reachable.`);
   }
-  registry.setPresenceSource(natsTransport);
-  const nc = natsTransport.getConnection();
-  if (!nc) throw new Error("NATS connection unavailable after init");
-  await history.init(nc);
+  try {
+    const nc = transport.getConnection();
+    if (!nc) throw new Error("NATS connection unavailable after init");
+    await history.init(nc);
+    registry.setPresenceSource(transport);
+    natsTransport = transport;
+  } catch (err) {
+    await transport.close();
+    throw err;
+  }
+}
+
+async function connectInfraWithRetry(): Promise<void> {
+  let delay = 1000;
+  for (;;) {
+    try {
+      await initInfra();
+      return;
+    } catch (err) {
+      console.error(`[nats] bus connecting, retry in ${delay}ms:`, err instanceof Error ? err.message : err);
+      await new Promise<void>((resolve) => setTimeout(resolve, delay).unref());
+      delay = Math.min(delay * 2, 30_000);
+    }
+  }
 }
 
 async function startStdio(): Promise<void> {
@@ -700,7 +726,7 @@ async function startStdio(): Promise<void> {
 }
 
 export function createHttpServer(
-  transport: AgentTransport | null = natsTransport,
+  transport: AgentTransport | null | (() => AgentTransport | null) = () => natsTransport,
   policy: HttpSecurityPolicy = readHttpSecurityPolicy(),
 ): Server {
   const ownedSessions = new Set<Session>();
@@ -759,7 +785,7 @@ export function createHttpServer(
 async function startHttp(): Promise<void> {
   const port = Number(process.env.AGENTS_HTTP_PORT) || 3000;
   const policy = readHttpSecurityPolicy();
-  const httpServer = createHttpServer(natsTransport, policy);
+  const httpServer = createHttpServer(() => natsTransport, policy);
   httpServer.listen(port, policy.host, () => {
     console.error(`agents MCP v${SERVER_VERSION} (streamable-http:${policy.host}:${port} + NATS@${natsTransport?.getHost()}) running`);
   });
@@ -797,7 +823,7 @@ function readBody(req: IncomingMessage): Promise<unknown> {
 }
 
 async function createHttpSession(
-  transportSource: AgentTransport | null,
+  transportSource: AgentTransport | null | (() => AgentTransport | null),
   policy: HttpSecurityPolicy,
   onClose: (session: Session) => void,
 ): Promise<Session> {
@@ -837,12 +863,12 @@ async function main(): Promise<void> {
   // Reject invalid boundary settings before opening infrastructure connections.
   if (transportMode === "http") readHttpSecurityPolicy();
   if (process.env.AGENTS_CODEX_NUDGES !== "0") resolveCodexNudgeTimeoutMs();
-  await initInfra();
   if (transportMode === "http") {
     await startHttp();
   } else {
     await startStdio();
   }
+  void connectInfraWithRetry();
 }
 
 // Importing the server factories must not connect to the shared bus. Resolve
