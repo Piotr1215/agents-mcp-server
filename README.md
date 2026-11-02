@@ -75,7 +75,7 @@ Published as a Docker image for shared deployments (homelab proving ground, loft
 piotrzan/agents-mcp-server:<version>
 ```
 
-The image bakes in no `AGENTS_*` defaults. Set `AGENTS_NATS_URL` and `AGENTS_TRANSPORT=http` in the deployment. HTTP binds to `127.0.0.1` by default. A container or shared deployment must set `AGENTS_HTTP_HOST` and `AGENTS_HTTP_ALLOWED_HOSTS` explicitly. The server fails at boot if NATS is unreachable or a remote bind has no allowed Host list.
+The image bakes in no `AGENTS_*` defaults. Set `AGENTS_NATS_URL` and `AGENTS_TRANSPORT=http` in the deployment. HTTP binds to `127.0.0.1` by default. A container or shared deployment must set `AGENTS_HTTP_HOST` and `AGENTS_HTTP_ALLOWED_HOSTS` explicitly. The server accepts MCP connections while it retries NATS with backoff; tools return `Error: bus connecting, retry.` until the bus and history are ready. A remote bind without an allowed Host list fails at boot.
 
 Shared HTTP deployments require an authenticated TLS gateway. This server does not authenticate HTTP callers. The gateway must control access to the shared agent bus and preserve an allowed Host header. Configure the public hostname and any health probe hostnames in `AGENTS_HTTP_ALLOWED_HOSTS`:
 
@@ -113,7 +113,7 @@ Client config for Claude Code:
 
 | Env | Default | Notes |
 |---|---|---|
-| `AGENTS_NATS_URL` | _(no default)_ | Required; server refuses to start if NATS is unreachable |
+| `AGENTS_NATS_URL` | `nats://nats.nats.svc:4222` | NATS endpoint; startup retries when unreachable |
 | `AGENTS_TRANSPORT` | `stdio` (code default; no default in the Docker image) | `stdio` or `http` |
 | `AGENTS_HTTP_PORT` | `3000` (code default) | HTTP mode only |
 | `AGENTS_HTTP_HOST` | `127.0.0.1` | Bind address in HTTP mode; set explicitly for containers or remote access |
@@ -193,6 +193,11 @@ Direct message to a specific agent.
 ```typescript
 { name: "researcher", to: "analyst", message: "Check this" }
 ```
+
+Messages to an unregistered recipient are published once to the same history
+stream and return `queued for analyst (not registered)`. After registering,
+the recipient can read them with `poll_messages` or `dm_history`. Advance the
+`since_id` cursor returned by `poll_messages` to avoid reading them twice.
 
 ### agent_discover
 

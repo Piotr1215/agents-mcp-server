@@ -817,6 +817,18 @@ describe("NatsTransport", () => {
       await recv.close();
     });
 
+    it("closes the connection before waiting for the status iterator", async () => {
+      const { nc, endStatus } = statefulFake(bus);
+      const drain = nc.drain.bind(nc);
+      nc.drain = async () => {
+        endStatus();
+        await drain();
+      };
+      const transport = new NatsTransport({ url: "fake", connector: async () => nc });
+      await transport.start();
+      await expect(transport.close()).resolves.toBeUndefined();
+    }, 1000);
+
     it("does not crash when the connection has no status() method (legacy fakes)", async () => {
       const t = new NatsTransport({
         url: "fake",
