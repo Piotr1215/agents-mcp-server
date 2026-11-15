@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createMcpServer, type AgentTransport, type SessionBinding } from "../src/index.js";
+import { createMcpServer, setNameClaims, type AgentTransport, type SessionBinding } from "../src/index.js";
+import { NameClaims, type ClaimStore } from "../src/claims.js";
 import * as registry from "../src/registry.js";
 import * as history from "../src/history.js";
 
@@ -212,5 +213,56 @@ describe("MCP session ownership", () => {
     expect(registry.getAgentByName("alice")).toBeNull();
     expect(transport.untrackLocal).toHaveBeenCalledWith(id);
     expect((await bob.register("alice")).isError).not.toBe(true);
+  });
+});
+
+describe("bus-wide name claims", () => {
+  // Minimal KV: create refuses a live key, update and delete check revision.
+  function memoryStore(): ClaimStore {
+    const keys = new Map<string, { value: Uint8Array; revision: number; operation: string }>();
+    let seq = 0;
+    return {
+      async create(key, value) {
+        if (keys.get(key)?.operation === "PUT") throw new Error("wrong last sequence");
+        keys.set(key, { value, revision: ++seq, operation: "PUT" });
+        return seq;
+      },
+      async get(key) { return keys.get(key) ?? null; },
+      async update(key, value, revision) {
+        if (keys.get(key)?.revision !== revision) throw new Error("wrong last sequence");
+        keys.set(key, { value, revision: ++seq, operation: "PUT" });
+        return seq;
+      },
+      async delete(key, previousSeq) {
+        if (keys.get(key)?.revision !== previousSeq) throw new Error("wrong last sequence");
+        keys.set(key, { value: new Uint8Array(), revision: ++seq, operation: "DEL" });
+      },
+    };
+  }
+
+  afterEach(() => setNameClaims(null));
+
+  it("refuses a name another server process holds, and frees it on deregister", async () => {
+    const store = memoryStore();
+    setNameClaims(new NameClaims(async () => store));
+    // A session in another process (another Claude on this host) holds the name.
+    const elsewhere = new NameClaims(async () => store);
+    await elsewhere.claim("hello-test", { instance: "other", agent_id: "x", group: "adhoc", host: "serval", ts: 1 });
+
+    const transport = fakeTransport();
+    const late = await caller(transport);
+    const refused = await late.register("hello-test", "adhoc");
+    expect(refused.isError).toBe(true);
+    expect(JSON.stringify(refused.content)).toMatch(/taken by a live session on serval \(group adhoc\)/);
+    expect(late.binding()).toBeNull();
+    expect(registry.getAgentByName("hello-test")).toBeNull();
+    expect(transport.trackLocal).not.toHaveBeenCalled();
+
+    await elsewhere.release("hello-test");
+    expect((await late.register("hello-test", "adhoc")).isError).toBeFalsy();
+    expect((await late.register("hello-test", "adhoc")).isError).toBeFalsy();
+    await late.call("agent_deregister", { name: "hello-test" });
+    await new Promise((r) => setTimeout(r, 0));
+    expect((await elsewhere.claim("hello-test", { instance: "other", agent_id: "x", group: "adhoc", host: "serval", ts: 2 })).ok).toBe(true);
   });
 });

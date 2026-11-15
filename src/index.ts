@@ -28,6 +28,7 @@ import { fileURLToPath } from "url";
 import * as registry from "./registry.js";
 import * as history from "./history.js";
 import { initNatsTransport, NatsTransport } from "./nats.js";
+import { CLAIM_REFRESH_MS, kvStore, NameClaims } from "./claims.js";
 import {
   buildChannelNotification,
   buildDmNotification,
@@ -65,6 +66,13 @@ interface BindingOwner {
 // Tool-supplied names are actor labels. Only the session that claimed a local
 // name may use it. Endpoint authentication belongs at the HTTP gateway.
 const agentOwners = new Map<string, BindingOwner>();
+
+// Bus-wide name claims (see claims.ts); null until NATS is up, and in tests
+// that do not set one.
+let nameClaims: NameClaims | null = null;
+export function setNameClaims(claims: NameClaims | null): void {
+  nameClaims = claims;
+}
 
 export type AgentTransport = Pick<NatsTransport,
   "getHost" | "trackLocal" | "untrackLocal" | "publishBeat" | "getRemotePeers" |
@@ -145,6 +153,8 @@ export function createMcpServer(
   transport: AgentTransport | null | (() => AgentTransport | null) = () => natsTransport,
 ): McpServer {
   let natsTransport = typeof transport === "function" ? transport() : transport;
+  // Identifies this MCP session in name claims, so a re-register is not a clash.
+  const instance = randomUUID();
   const withReady = (fn: () => Promise<string>) => withMeta(() => {
     if (typeof transport === "function") {
       natsTransport = transport();
@@ -180,6 +190,7 @@ export function createMcpServer(
     if (!binding) return;
     if (agentOwners.get(binding.name) === session) {
       agentOwners.delete(binding.name);
+      void nameClaims?.release(binding.name);
       registry.deregisterAgent(binding.agentId);
       natsTransport?.untrackLocal(binding.agentId);
     }
@@ -208,6 +219,10 @@ export function createMcpServer(
       const owner = agentOwners.get(name);
       if ((owner && owner !== session) || (registry.getAgentByName(name) && owner !== session)) {
         throw new Error(`Agent '${name}' is owned by another session. Use a free name or close the owning session first.`);
+      }
+      const claim = await nameClaims?.claim(name, { instance, agent_id: agentId, group: groupName, host, ts: Date.now() });
+      if (claim && !claim.ok) {
+        throw new Error(`Agent '${name}' is taken by a live session on ${claim.holder.host} (group ${claim.holder.group}). Pick another name.`);
       }
       const previous = session.getBinding();
       if (previous && previous.name !== name) releaseBinding();
@@ -682,6 +697,9 @@ async function initInfra(): Promise<void> {
     const nc = transport.getConnection();
     if (!nc) throw new Error("NATS connection unavailable after init");
     await history.init(nc);
+    const claims = new NameClaims(kvStore(nc));
+    setInterval(() => void claims.refreshAll(), CLAIM_REFRESH_MS).unref();
+    nameClaims = claims;
     registry.setPresenceSource(transport);
     natsTransport = transport;
   } catch (err) {
