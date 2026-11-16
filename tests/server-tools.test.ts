@@ -4,6 +4,13 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer, type AgentTransport, type SessionBinding } from "../src/index.js";
 import * as registry from "../src/registry.js";
 import * as history from "../src/history.js";
+import { NatsTransport } from "../src/nats.js";
+import { resolveWorkerDm } from "../src/dm-intake.js";
+
+vi.mock("../src/dm-intake.js", () => ({
+  resolveWorkerDm: vi.fn(async () => true),
+  shouldRouteWorkerDm: (from: string, to: string) => from === "worker" && to === "triage",
+}));
 
 vi.mock("../src/history.js", () => ({
   getDmHistory: vi.fn(async () => []),
@@ -174,6 +181,49 @@ describe("MCP session ownership", () => {
     expect(JSON.parse((secondPoll.content[0] as { text: string }).text)).toMatchObject({ messages: [], last_id: 1 });
     expect(transport.publishDirectMessage).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["sync rejection", "async rejection", "missing ack", "closed transport", "acknowledged"])(
+    "handles resolved history publish: %s", async (mode) => {
+      const bus = new NatsTransport({ url: "fake", host: "test-local" });
+      const attempts: Array<{ subject: string; payload: any }> = [];
+      const publishHistory = vi.fn((subject: string, data: Uint8Array) => {
+        attempts.push({ subject, payload: JSON.parse(Buffer.from(data).toString()) });
+        if (mode === "sync rejection") throw new Error("sync failure");
+        if (mode === "async rejection") return Promise.reject(new Error("no ack"));
+        if (mode === "missing ack") return Promise.resolve(undefined);
+        return Promise.resolve({ stream: "history", seq: 1 });
+      });
+      const connection = {
+        jetstream: () => ({ publish: publishHistory }),
+        publish: (subject: string, data: Uint8Array) => attempts.push({ subject, payload: JSON.parse(Buffer.from(data).toString()) }),
+      };
+      Object.assign(bus, { nc: connection, closed: mode === "closed transport" });
+      const transport = fakeTransport();
+      const live = vi.fn(bus.publishDirectMessage.bind(bus));
+      transport.publishDirectMessage = live;
+      const worker = await caller(transport);
+      await worker.register("worker");
+      const result = await worker.call("agent_dm", { name: "worker", to: "triage", message: "done" });
+      expect(result.isError).not.toBe(true);
+      expect(resolveWorkerDm).toHaveBeenCalled();
+      const calls = live.mock.calls;
+      expect(calls).toHaveLength(mode === "acknowledged" ? 1 : 2);
+      expect(calls[0][3]).toBe(true);
+      if (mode !== "acknowledged") {
+        expect(calls[1][3]).toBe(false);
+        expect(calls[1][4]).toEqual(calls[0][4]);
+        expect((result.content[0] as { text: string }).text).not.toContain("recorded");
+        if (mode !== "closed transport") {
+          expect(attempts.map(a => a.subject)).toEqual(["agents.dm.dHJpYWdl.resolved", "agents.dm.dHJpYWdl"]);
+          expect(attempts[1].payload.message_id).toBe(attempts[0].payload.message_id);
+          expect(attempts[1].payload.message_ts).toBe(attempts[0].payload.message_ts);
+        }
+      } else {
+        expect((result.content[0] as { text: string }).text).toContain("recorded");
+        expect(attempts).toHaveLength(1);
+      }
+    },
+  );
 
   it("releases the previous name when the owner renames", async () => {
     const transport = fakeTransport();

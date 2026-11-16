@@ -81,6 +81,7 @@ function fakeConnection(bus: FakeBus): NatsConnection {
   return {
     publish: (subject: string, data?: Uint8Array) => bus.publish(subject, data ?? new Uint8Array()),
     subscribe: (subject: string) => makeSub(subject),
+    jetstream: () => ({ publish: async (subject: string, data: Uint8Array) => { bus.publish(subject, data); return { stream: "history", seq: 1 }; } }),
     drain: async () => { /* noop */ },
     close: async () => { /* noop */ },
   } as unknown as NatsConnection;
@@ -423,6 +424,21 @@ describe("NatsTransport", () => {
       });
       await sender.close();
       await recv.close();
+    });
+
+    it("does not deliver history-only DMs to live subscribers", async () => {
+      const received: RemoteDirectMessage[] = [];
+      const recorded: any[] = [];
+      bus.subscribe((subject, data) => { if (subject.endsWith(".resolved")) recorded.push(JSON.parse(Buffer.from(data).toString())); });
+      const recv = new NatsTransport({ url: "fake", host: "recv", onDirectMessage: m => received.push(m), connector: async () => fakeConnection(bus) });
+      const sender = new NatsTransport({ url: "fake", host: "sender", connector: async () => fakeConnection(bus) });
+      await recv.start(); await sender.start();
+      await sender.publishDirectMessage("triage", "worker", "resolved", true, { id: "message-1", ts: "2026-11-16T00:00:00Z" });
+      sender.publishDirectMessage("triage", "worker", "shown");
+      await new Promise(r => setTimeout(r, 10));
+      expect(received.map(m => m.content)).toEqual(["shown"]);
+      expect(recorded).toMatchObject([{ message_id: "message-1", message_ts: "2026-11-16T00:00:00Z" }]);
+      await sender.close(); await recv.close();
     });
 
     // See channel pub/sub section for the #127 rationale — same shape here.
