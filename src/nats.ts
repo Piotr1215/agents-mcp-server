@@ -197,9 +197,10 @@ export class NatsTransport {
     this.nc.publish(channelToSubject(channel), Buffer.from(JSON.stringify(payload)));
   }
 
-  publishDirectMessage(toAgent: string, fromAgent: string, content: string, historyOnly = false): void {
+  publishDirectMessage(toAgent: string, fromAgent: string, content: string, historyOnly = false, identity?: { id: string; ts: string }): void {
     if (!this.nc || this.closed) return;
     const payload = {
+      ...(identity ? { message_id: identity.id, message_ts: identity.ts } : {}),
       to_agent: toAgent,
       from_agent: fromAgent,
       content,

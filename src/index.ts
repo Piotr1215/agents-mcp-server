@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { resolveWorkerDm } from "./dm-intake.js";
+import { resolveWorkerDm, shouldRouteWorkerDm } from "./dm-intake.js";
 // PROJECT: claude-automation, agent-lifecycle, agents-mcp-homelab-deploy
 // Issue: https://github.com/Piotr1215/claude/issues/42 (lineage), #129 (DuckDB drop)
 //
@@ -322,9 +322,14 @@ export function createMcpServer(
         hasRemotePeer: (n) => natsTransport!.getRemotePeers().some((p) => p.name === n),
       });
       logToFile("DM", `${name} -> ${to}: ${message}`);
-      const resolved = await resolveWorkerDm(name, to, message);
-      if (resolved) natsTransport.publishDirectMessage(to, name, message, true);
-      else natsTransport.publishDirectMessage(to, name, message);
+      const id = randomUUID();
+      const ts = new Date().toISOString();
+      const resolved = await resolveWorkerDm(name, to, message, id, ts);
+      if (shouldRouteWorkerDm(name, to)) {
+        natsTransport.publishDirectMessage(to, name, message, resolved, { id, ts });
+      } else {
+        natsTransport.publishDirectMessage(to, name, message);
+      }
       if (resolved) return `DM recorded for ${to}; intake resolved it.`;
       if (!reachable) return `queued for ${to} (not registered)`;
       return `DM published to '${to}' over NATS. Live delivery happens when the recipient session is registered (agent_register auto-binds); otherwise the message stays in dm_history for catch-up.`;

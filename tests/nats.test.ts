@@ -427,13 +427,16 @@ describe("NatsTransport", () => {
 
     it("does not deliver history-only DMs to live subscribers", async () => {
       const received: RemoteDirectMessage[] = [];
+      const recorded: any[] = [];
+      bus.subscribe((subject, data) => { if (subject.endsWith(".resolved")) recorded.push(JSON.parse(Buffer.from(data).toString())); });
       const recv = new NatsTransport({ url: "fake", host: "recv", onDirectMessage: m => received.push(m), connector: async () => fakeConnection(bus) });
       const sender = new NatsTransport({ url: "fake", host: "sender", connector: async () => fakeConnection(bus) });
       await recv.start(); await sender.start();
-      sender.publishDirectMessage("triage", "worker", "resolved", true);
+      sender.publishDirectMessage("triage", "worker", "resolved", true, { id: "message-1", ts: "2026-11-16T00:00:00Z" });
       sender.publishDirectMessage("triage", "worker", "shown");
       await new Promise(r => setTimeout(r, 10));
       expect(received.map(m => m.content)).toEqual(["shown"]);
+      expect(recorded).toMatchObject([{ message_id: "message-1", message_ts: "2026-11-16T00:00:00Z" }]);
       await sender.close(); await recv.close();
     });
 

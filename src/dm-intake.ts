@@ -1,12 +1,15 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 
 export interface DmRecord { from: string; to: string; body: string; id: string; ts: string }
 
+export function shouldRouteWorkerDm(from: string, to: string): boolean {
+  return process.env.AGENTS_INTAKE_DM !== "0" && to === "triage" && !/^(human|intake$|rsi$|ledger$)/.test(from);
+}
+
 // Intake decides; any failure leaves the existing delivery path in charge.
-export async function resolveWorkerDm(from: string, to: string, body: string): Promise<boolean> {
-  if (process.env.AGENTS_INTAKE_DM === "0" || to !== "triage" || /^(human|intake$|rsi$|ledger$)/.test(from)) return false;
-  const record: DmRecord = { from, to, body, id: randomUUID(), ts: new Date().toISOString() };
+export async function resolveWorkerDm(from: string, to: string, body: string, id: string, ts: string): Promise<boolean> {
+  if (!shouldRouteWorkerDm(from, to)) return false;
+  const record: DmRecord = { from, to, body, id, ts };
   const event = { specversion: "1.0", id: record.id, source: "agent-dm", type: "agent-dm.message", time: record.ts,
     line: `${from} -> ${to}: ${body}`, body, meta: { from, to, message_id: record.id, ts: record.ts } };
   return new Promise((resolve) => {
