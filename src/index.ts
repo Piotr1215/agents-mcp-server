@@ -326,11 +326,18 @@ export function createMcpServer(
       const ts = new Date().toISOString();
       const resolved = await resolveWorkerDm(name, to, message, id, ts);
       if (shouldRouteWorkerDm(name, to)) {
-        natsTransport.publishDirectMessage(to, name, message, resolved, { id, ts });
+        if (resolved) {
+          try {
+            await natsTransport.publishDirectMessage(to, name, message, true, { id, ts });
+            return `DM recorded for ${to}; intake resolved it.`;
+          } catch {
+            // History was not confirmed; fall back to the normal live path once.
+          }
+        }
+        natsTransport.publishDirectMessage(to, name, message, false, { id, ts });
       } else {
         natsTransport.publishDirectMessage(to, name, message);
       }
-      if (resolved) return `DM recorded for ${to}; intake resolved it.`;
       if (!reachable) return `queued for ${to} (not registered)`;
       return `DM published to '${to}' over NATS. Live delivery happens when the recipient session is registered (agent_register auto-binds); otherwise the message stays in dm_history for catch-up.`;
     }),

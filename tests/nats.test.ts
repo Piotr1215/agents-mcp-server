@@ -81,6 +81,7 @@ function fakeConnection(bus: FakeBus): NatsConnection {
   return {
     publish: (subject: string, data?: Uint8Array) => bus.publish(subject, data ?? new Uint8Array()),
     subscribe: (subject: string) => makeSub(subject),
+    jetstream: () => ({ publish: async (subject: string, data: Uint8Array) => { bus.publish(subject, data); return { stream: "history", seq: 1 }; } }),
     drain: async () => { /* noop */ },
     close: async () => { /* noop */ },
   } as unknown as NatsConnection;
@@ -432,7 +433,7 @@ describe("NatsTransport", () => {
       const recv = new NatsTransport({ url: "fake", host: "recv", onDirectMessage: m => received.push(m), connector: async () => fakeConnection(bus) });
       const sender = new NatsTransport({ url: "fake", host: "sender", connector: async () => fakeConnection(bus) });
       await recv.start(); await sender.start();
-      sender.publishDirectMessage("triage", "worker", "resolved", true, { id: "message-1", ts: "2026-11-16T00:00:00Z" });
+      await sender.publishDirectMessage("triage", "worker", "resolved", true, { id: "message-1", ts: "2026-11-16T00:00:00Z" });
       sender.publishDirectMessage("triage", "worker", "shown");
       await new Promise(r => setTimeout(r, 10));
       expect(received.map(m => m.content)).toEqual(["shown"]);
