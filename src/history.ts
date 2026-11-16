@@ -17,6 +17,7 @@ export interface HistoryMessage {
   channel: string | null;
   content: string;
   origin_host: string;
+  message_id?: string;
 }
 
 const STREAM_NAME = "agents-history";
@@ -82,6 +83,7 @@ interface RawEnvelope {
     origin_host?: string;
     origin_ts?: number;
     origin_seq?: number;
+    message_id?: string;
   };
 }
 
@@ -177,6 +179,7 @@ function toHistoryMessage(env: RawEnvelope): HistoryMessage {
     channel: type === "CHANNEL" ? (p.channel ?? null) : (type === "BROADCAST" ? (p.group ?? null) : null),
     content: p.content ?? "",
     origin_host: p.origin_host ?? "",
+    ...(p.message_id ? { message_id: p.message_id } : {}),
   };
 }
 

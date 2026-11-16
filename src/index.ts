@@ -421,6 +421,7 @@ export function createMcpServer(
           count: messages.length,
           messages: messages.map((m) => ({
             id: m.id,
+            ...(m.message_id ? { message_id: m.message_id } : {}),
             timestamp: m.timestamp,
             from: m.from_agent,
             content: m.content,
