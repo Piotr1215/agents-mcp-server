@@ -197,9 +197,13 @@ export class NatsTransport {
     this.nc.publish(channelToSubject(channel), Buffer.from(JSON.stringify(payload)));
   }
 
-  publishDirectMessage(toAgent: string, fromAgent: string, content: string): void {
-    if (!this.nc || this.closed) return;
+  publishDirectMessage(toAgent: string, fromAgent: string, content: string, historyOnly = false, identity?: { id: string; ts: string }): void | Promise<void> {
+    if (!this.nc || this.closed) {
+      if (historyOnly) return Promise.reject(new Error("NATS transport is closed"));
+      return;
+    }
     const payload = {
+      ...(identity ? { message_id: identity.id, message_ts: identity.ts } : {}),
       to_agent: toAgent,
       from_agent: fromAgent,
       content,
@@ -207,7 +211,14 @@ export class NatsTransport {
       origin_ts: this.now(),
       origin_seq: this.seq++,
     };
-    this.nc.publish(dmToSubject(toAgent), Buffer.from(JSON.stringify(payload)));
+    const data = Buffer.from(JSON.stringify(payload));
+    const subject = dmToSubject(toAgent);
+    if (historyOnly) {
+      return this.nc.jetstream().publish(subject + ".resolved", data).then((ack) => {
+        if (!ack || !ack.stream || !ack.seq) throw new Error("JetStream publish was not acknowledged");
+      });
+    }
+    this.nc.publish(subject, data);
   }
 
   publishBroadcast(group: string, fromAgent: string, content: string): void {

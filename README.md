@@ -123,6 +123,7 @@ Client config for Claude Code:
 | `AGENTS_HISTORY_MAX_AGE_MS` | `30d` | JetStream stream retention |
 | `AGENTS_HISTORY_MAX_BYTES` | `512 MiB` | JetStream stream cap |
 | `AGENTS_HISTORY_MAX_MSGS_PER_SUBJECT` | `10000` | Per-subject cap |
+| `AGENTS_INTAKE_DM` | `1` | Set to `0` to bypass intake for worker DMs to triage. If intake fails or times out, delivery proceeds normally. |
 | `AGENTS_LOG_FILE` | _unset_ | When set, writes a local audit log (stdio installs); unset in the default Docker image |
 
 ## `snd` CLI
