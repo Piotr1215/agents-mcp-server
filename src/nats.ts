@@ -197,7 +197,7 @@ export class NatsTransport {
     this.nc.publish(channelToSubject(channel), Buffer.from(JSON.stringify(payload)));
   }
 
-  publishDirectMessage(toAgent: string, fromAgent: string, content: string): void {
+  publishDirectMessage(toAgent: string, fromAgent: string, content: string, historyOnly = false): void {
     if (!this.nc || this.closed) return;
     const payload = {
       to_agent: toAgent,
@@ -207,7 +207,7 @@ export class NatsTransport {
       origin_ts: this.now(),
       origin_seq: this.seq++,
     };
-    this.nc.publish(dmToSubject(toAgent), Buffer.from(JSON.stringify(payload)));
+    this.nc.publish(dmToSubject(toAgent) + (historyOnly ? ".resolved" : ""), Buffer.from(JSON.stringify(payload)));
   }
 
   publishBroadcast(group: string, fromAgent: string, content: string): void {

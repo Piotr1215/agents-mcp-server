@@ -425,6 +425,18 @@ describe("NatsTransport", () => {
       await recv.close();
     });
 
+    it("does not deliver history-only DMs to live subscribers", async () => {
+      const received: RemoteDirectMessage[] = [];
+      const recv = new NatsTransport({ url: "fake", host: "recv", onDirectMessage: m => received.push(m), connector: async () => fakeConnection(bus) });
+      const sender = new NatsTransport({ url: "fake", host: "sender", connector: async () => fakeConnection(bus) });
+      await recv.start(); await sender.start();
+      sender.publishDirectMessage("triage", "worker", "resolved", true);
+      sender.publishDirectMessage("triage", "worker", "shown");
+      await new Promise(r => setTimeout(r, 10));
+      expect(received.map(m => m.content)).toEqual(["shown"]);
+      await sender.close(); await recv.close();
+    });
+
     // See channel pub/sub section for the #127 rationale — same shape here.
     it("delivers same-host DMs to the callback (handler handles echo suppression)", async () => {
       const received: RemoteDirectMessage[] = [];

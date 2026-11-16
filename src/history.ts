@@ -114,11 +114,12 @@ async function drain(filterSubjects: string[], limit: number, minSeq?: number): 
   } else {
     consumerConfig.deliver_policy = "all";
     try {
-      const streamInfo = await jsm.streams.info(STREAM_NAME, {
-        subjects_filter: filterSubjects[0],
-      } as never);
-      const subjectCounts = (streamInfo.state as { subjects?: Record<string, number> }).subjects ?? {};
-      const matchingTotal = Object.values(subjectCounts).reduce((a, b) => a + b, 0);
+      let matchingTotal = 0;
+      for (const filter of filterSubjects) {
+        const streamInfo = await jsm.streams.info(STREAM_NAME, { subjects_filter: filter } as never);
+        const counts = (streamInfo.state as { subjects?: Record<string, number> }).subjects ?? {};
+        matchingTotal += Object.values(counts).reduce((a, b) => a + b, 0);
+      }
       if (matchingTotal > 0) fetchLimit = matchingTotal;
     } catch (err) {
       console.error("[history] subject info fetch failed, falling back to limit:", err);
@@ -194,7 +195,7 @@ export async function getGroupHistory(group: string, limit = 50): Promise<Histor
 // for messages where the other party is the counterparty.
 export async function getDmHistory(agent1: string, agent2: string, limit = 50): Promise<HistoryMessage[]> {
   const envs = await drain(
-    [`${SUBJECT_PREFIX_DM}${encode(agent1)}`, `${SUBJECT_PREFIX_DM}${encode(agent2)}`],
+    [`${SUBJECT_PREFIX_DM}${encode(agent1)}`, `${SUBJECT_PREFIX_DM}${encode(agent1)}.resolved`, `${SUBJECT_PREFIX_DM}${encode(agent2)}`, `${SUBJECT_PREFIX_DM}${encode(agent2)}.resolved`],
     limit * 2,
   );
   const filtered = envs.filter((e) => {
