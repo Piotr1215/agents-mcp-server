@@ -8,7 +8,7 @@ import { NatsTransport } from "../src/nats.js";
 import { resolveWorkerDm } from "../src/dm-intake.js";
 
 vi.mock("../src/dm-intake.js", () => ({
-  resolveWorkerDm: vi.fn(async () => true),
+  resolveWorkerDm: vi.fn(async (): Promise<"resolved" | "show" | "fallback"> => "resolved"),
   shouldRouteWorkerDm: (from: string, to: string) => from === "worker" && to === "triage",
 }));
 
@@ -224,6 +224,21 @@ describe("MCP session ownership", () => {
       }
     },
   );
+
+  it.each(["show", "fallback"] as const)("delivers the full body for %s", async (route) => {
+    vi.mocked(resolveWorkerDm).mockResolvedValueOnce(route);
+    const transport = fakeTransport();
+    const worker = await caller(transport);
+    await worker.register("worker");
+    const body = "first line\nsecond line";
+    await worker.call("agent_dm", { name: "worker", to: "triage", message: body });
+    const [to, from, delivered, historyOnly, identity] = vi.mocked(transport.publishDirectMessage).mock.calls[0];
+    expect(to).toBe("triage");
+    expect(from).toBe("worker");
+    expect(historyOnly).toBe(false);
+    expect(delivered).toBe(route === "show" ? `${body} [event_id:${identity!.id}]` : body);
+    expect(resolveWorkerDm).toHaveBeenCalledWith("worker", "triage", body, identity!.id, identity!.ts);
+  });
 
   it("releases the previous name when the owner renames", async () => {
     const transport = fakeTransport();
