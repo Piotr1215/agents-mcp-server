@@ -16,15 +16,19 @@ function fakeChild(output: string, code: number | null = 0, fail = false) {
 }
 afterEach(() => { vi.useRealTimers(); vi.unstubAllEnvs(); vi.clearAllMocks(); });
 describe("worker DM routing", () => {
-  it.each([["resolved", true], ["dropped", true], ["shown", false]])("routes %s", async (terminal, expected) => {
-    const child = fakeChild(JSON.stringify({ terminal }));
+  it.each([["resolved", "resolved"], ["dropped", "resolved"], ["shown_gordon", "show"], ["shown_other", "fallback"]])("routes %s", async (terminal, expected) => {
+    const child = fakeChild(JSON.stringify({ terminal, correlation_id: "id-1" }));
     expect(await resolveWorkerDm("worker", "triage", "body", "id-1", "2026-11-16T00:00:00Z")).toBe(expected);
     expect(JSON.parse(child.stdin.end.mock.calls[0][0])).toMatchObject({body:"body", id:"id-1", meta:{from:"worker",to:"triage",message_id:"id-1"}});
   });
-  it.each(["human", "human-piotr", "intake", "rsi", "ledger"])("excludes %s", async from => {
-    expect(await resolveWorkerDm(from, "triage", "x", "id-1", "2026-11-16T00:00:00Z")).toBe(false); expect(spawn).not.toHaveBeenCalled();
+  it("falls back when the returned event id differs", async () => {
+    fakeChild(JSON.stringify({ terminal: "shown_gordon", correlation_id: "other" }));
+    expect(await resolveWorkerDm("worker", "triage", "body", "id-1", "2026-11-16T00:00:00Z")).toBe("fallback");
   });
-  it("honors the off switch", async () => { vi.stubEnv("AGENTS_INTAKE_DM", "0"); expect(await resolveWorkerDm("worker", "triage", "x", "id-1", "2026-11-16T00:00:00Z")).toBe(false); expect(spawn).not.toHaveBeenCalled(); });
-  it.each([["", 1, false], ["bad", 0, false], ["", 0, true]] as const)("delivers on error", async (out, code, fail) => { fakeChild(out, code, fail); expect(await resolveWorkerDm("worker", "triage", "x", "id-1", "2026-11-16T00:00:00Z")).toBe(false); });
-  it("delivers on timeout", async () => { vi.useFakeTimers(); const child = fakeChild("", null); const result = resolveWorkerDm("worker", "triage", "x", "id-1", "2026-11-16T00:00:00Z"); await vi.advanceTimersByTimeAsync(3000); expect(await result).toBe(false); expect(child.kill).toHaveBeenCalled(); });
+  it.each(["human", "human-piotr", "intake", "rsi", "ledger"])("excludes %s", async from => {
+    expect(await resolveWorkerDm(from, "triage", "x", "id-1", "2026-11-16T00:00:00Z")).toBe("fallback"); expect(spawn).not.toHaveBeenCalled();
+  });
+  it("honors the off switch", async () => { vi.stubEnv("AGENTS_INTAKE_DM", "0"); expect(await resolveWorkerDm("worker", "triage", "x", "id-1", "2026-11-16T00:00:00Z")).toBe("fallback"); expect(spawn).not.toHaveBeenCalled(); });
+  it.each([["", 1, false], ["bad", 0, false], ["", 0, true]] as const)("delivers on error", async (out, code, fail) => { fakeChild(out, code, fail); expect(await resolveWorkerDm("worker", "triage", "x", "id-1", "2026-11-16T00:00:00Z")).toBe("fallback"); });
+  it("delivers on timeout", async () => { vi.useFakeTimers(); const child = fakeChild("", null); const result = resolveWorkerDm("worker", "triage", "x", "id-1", "2026-11-16T00:00:00Z"); await vi.advanceTimersByTimeAsync(3000); expect(await result).toBe("fallback"); expect(child.kill).toHaveBeenCalled(); });
 });

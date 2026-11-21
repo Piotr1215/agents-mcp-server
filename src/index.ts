@@ -400,9 +400,9 @@ export function createMcpServer(
       logToFile("DM", `${name} -> ${to}: ${message}`);
       const id = randomUUID();
       const ts = new Date().toISOString();
-      const resolved = await resolveWorkerDm(name, to, message, id, ts);
+      const route = await resolveWorkerDm(name, to, message, id, ts);
       if (shouldRouteWorkerDm(name, to)) {
-        if (resolved) {
+        if (route === "resolved") {
           try {
             await natsTransport.publishDirectMessage(to, name, message, true, { id, ts });
             return `DM recorded for ${to}; intake resolved it.`;
@@ -410,7 +410,8 @@ export function createMcpServer(
             // History was not confirmed; fall back to the normal live path once.
           }
         }
-        natsTransport.publishDirectMessage(to, name, message, false, { id, ts });
+        const delivered = route === "show" ? `${message} [event_id:${id}]` : message;
+        natsTransport.publishDirectMessage(to, name, delivered, false, { id, ts });
       } else {
         natsTransport.publishDirectMessage(to, name, message);
       }
