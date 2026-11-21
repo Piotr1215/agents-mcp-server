@@ -81,5 +81,6 @@ describe("stdio startup without NATS", () => {
 
     const result = await waitForResponse(child, 2, 2_000);
     expect(JSON.stringify(result)).toContain("Error: bus connecting, retry.");
+    expect((result.result as { isError?: boolean }).isError).toBe(true);
   }, 8_000);
 });

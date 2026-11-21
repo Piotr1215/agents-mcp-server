@@ -29,6 +29,7 @@ import { fileURLToPath } from "url";
 import * as registry from "./registry.js";
 import * as history from "./history.js";
 import { initNatsTransport, NatsTransport } from "./nats.js";
+import { CLAIM_REFRESH_MS, kvStore, NameClaims } from "./claims.js";
 import {
   buildChannelNotification,
   buildDmNotification,
@@ -47,6 +48,7 @@ import {
   readCodexBinding,
   resolveCodexNudgeTimeoutMs,
 } from "./codex-nudges.js";
+import { clipContent, fitToBudget, limitSchema, sinceIdSchema } from "./bounds.js";
 import { readHttpSecurityPolicy, validateHttpRequest, type HttpSecurityPolicy } from "./http-security.js";
 
 const SERVER_NAME = "agents";
@@ -66,6 +68,13 @@ interface BindingOwner {
 // Tool-supplied names are actor labels. Only the session that claimed a local
 // name may use it. Endpoint authentication belongs at the HTTP gateway.
 const agentOwners = new Map<string, BindingOwner>();
+
+// Bus-wide name claims (see claims.ts); null until NATS is up, and in tests
+// that do not set one.
+let nameClaims: NameClaims | null = null;
+export function setNameClaims(claims: NameClaims | null): void {
+  nameClaims = claims;
+}
 
 export type AgentTransport = Pick<NatsTransport,
   "getHost" | "trackLocal" | "untrackLocal" | "publishBeat" | "getRemotePeers" |
@@ -122,23 +131,81 @@ function logToFile(type: string, content: string): void {
   } catch { /* best-effort */ }
 }
 
-// Wrap a handler so every response carries `_meta` with chars/lines/ms. The
+// An expected execution failure: wrong owner, bad argument, bus not ready. It
+// reaches the client as a result with isError true and a recovery message.
+export class ToolFailure extends Error {}
+
+export interface ToolResult {
+  [key: string]: unknown;
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+}
+
+// Wrap a handler so every response carries `_meta` with chars/lines/ms. A
+// ToolFailure or any other thrown error becomes an isError result: a text
+// that starts with "Error:" alone looks like success to protocol clients. The
 // old implementation also wrote per-call rows to DuckDB's tool_metrics; that
 // telemetry store is gone with #129. If anyone wants per-tool metrics again,
 // they'll land on a dedicated JetStream subject, not a relational store.
-async function withMeta(
-  fn: () => Promise<string>,
-): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+async function withMeta(fn: () => Promise<string>): Promise<ToolResult> {
   const startTime = Date.now();
-  const result = await fn();
+  let result: string;
+  try {
+    result = await fn();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { content: [{ type: "text", text: message.startsWith("Error:") ? message : `Error: ${message}` }], isError: true };
+  }
   const durationMs = Date.now() - startTime;
-  const responseChars = result.length;
-  const responseLines = result.split("\n").length;
-  const meta = { chars: responseChars, lines: responseLines, ms: durationMs };
+  const meta = { chars: result.length, lines: result.split("\n").length, ms: durationMs };
   const finalResult = result.startsWith("{")
     ? JSON.stringify({ ...JSON.parse(result), _meta: meta })
     : `${result}\n---\n_meta: ${JSON.stringify(meta)}`;
   return { content: [{ type: "text", text: finalResult }] };
+}
+
+// Note appended when older history did not fit the result budget.
+function omittedNote(all: history.HistoryMessage[], omitted: number): string {
+  const firstId = all[0]?.id ?? 0;
+  return `${omitted} older message${omitted === 1 ? "" : "s"} omitted to keep this result under the size cap. ` +
+    `Ask for a smaller limit to see fewer, or read forward with messages_since(since_id=${Math.max(firstId - 1, 0)}); ` +
+    `it spans every subject, so filter by channel, group or agent.`;
+}
+
+// Compact history text, newest messages first in priority, oldest-to-newest on screen.
+function compactHistory(header: (count: number) => string, messages: history.HistoryMessage[], blank: string): string {
+  const lines = messages.map((m) => {
+    const ts = new Date(m.timestamp).toLocaleTimeString();
+    const from = m.from_agent?.split("-")[0] || blank;
+    return `[${ts}] ${from}: ${clipContent(m.content)}`;
+  });
+  const { kept, omitted } = fitToBudget(lines, (l) => l.length, "newest");
+  const note = omitted > 0 ? `\n${omittedNote(messages, omitted)}` : "";
+  return `${header(kept.length)}:\n${kept.join("\n")}${note}`;
+}
+
+// Detailed history JSON under the same budget.
+function detailedHistory(head: Record<string, unknown>, messages: history.HistoryMessage[], shape: (m: history.HistoryMessage) => Record<string, unknown>): string {
+  const rows = messages.map((m) => shape({ ...m, content: clipContent(m.content) }));
+  const { kept, omitted } = fitToBudget(rows, (r) => JSON.stringify(r).length, "newest");
+  return JSON.stringify({
+    ...head,
+    count: kept.length,
+    ...(omitted > 0 ? { omitted, note: omittedNote(messages, omitted) } : {}),
+    messages: kept,
+  });
+}
+
+// Forward polls keep the oldest messages so last_id never skips one; the
+// caller pages by calling again with since_id = last_id.
+function pollResult(sinceId: number, rows: Array<{ id: number }>): string {
+  if (rows.length === 0) return JSON.stringify({ messages: [], last_id: sinceId });
+  const { kept, omitted } = fitToBudget(rows, (r) => JSON.stringify(r).length, "oldest");
+  return JSON.stringify({
+    messages: kept,
+    last_id: kept[kept.length - 1].id,
+    ...(omitted > 0 ? { omitted, note: `${omitted} more message${omitted === 1 ? "" : "s"} not returned to stay under the size cap. Call again with since_id=last_id to read them.` } : {}),
+  });
 }
 
 export function createMcpServer(
@@ -146,10 +213,14 @@ export function createMcpServer(
   transport: AgentTransport | null | (() => AgentTransport | null) = () => natsTransport,
 ): McpServer {
   let natsTransport = typeof transport === "function" ? transport() : transport;
+  // Identifies this MCP session in name claims, so a re-register is not a clash.
+  const instance = randomUUID();
   const withReady = (fn: () => Promise<string>) => withMeta(() => {
     if (typeof transport === "function") {
       natsTransport = transport();
-      if (!natsTransport) return Promise.resolve("Error: bus connecting, retry.");
+      if (!natsTransport) {
+        return Promise.reject(new ToolFailure("bus connecting, retry. The server is still joining the NATS bus; wait a few seconds and repeat the call."));
+      }
     }
     return fn();
   });
@@ -181,6 +252,7 @@ export function createMcpServer(
     if (!binding) return;
     if (agentOwners.get(binding.name) === session) {
       agentOwners.delete(binding.name);
+      void nameClaims?.release(binding.name);
       registry.deregisterAgent(binding.agentId);
       natsTransport?.untrackLocal(binding.agentId);
     }
@@ -199,7 +271,7 @@ export function createMcpServer(
         description: z.string().describe("What this agent does"),
         group: z.string().optional().default("default").describe("Agent group (default: 'default')"),
       },
-      annotations: { readOnlyHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ name, group }) => withReady(async () => {
       const groupName = group || "default";
@@ -209,6 +281,10 @@ export function createMcpServer(
       const owner = agentOwners.get(name);
       if ((owner && owner !== session) || (registry.getAgentByName(name) && owner !== session)) {
         throw new Error(`Agent '${name}' is owned by another session. Use a free name or close the owning session first.`);
+      }
+      const claim = await nameClaims?.claim(name, { instance, agent_id: agentId, group: groupName, host, ts: Date.now() });
+      if (claim && !claim.ok) {
+        throw new Error(`Agent '${name}' is taken by a live session on ${claim.holder.host} (group ${claim.holder.group}). Pick another name.`);
       }
       const previous = session.getBinding();
       if (previous && previous.name !== name) releaseBinding();
@@ -243,7 +319,7 @@ export function createMcpServer(
       title: "Leave Conversation",
       description: "Deregister an agent when shutting down.",
       inputSchema: { name: z.string().describe("Your agent name") },
-      annotations: { destructiveHint: true },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ name }) => withReady(async () => {
       const agent = registry.getAgentByName(name);
@@ -273,22 +349,22 @@ export function createMcpServer(
         priority: z.enum(["low", "normal", "high"]).optional().default("normal").describe("Message priority"),
         group: z.string().optional().describe("Target group (omit for all agents)"),
       },
-      annotations: { readOnlyHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     async ({ name, message, group }) => withReady(async () => {
       const sender = requireOwner(name);
       const bodyErr = validateMessageBody(message);
-      if (bodyErr) return `Error: broadcast ${bodyErr}.`;
-      if (!natsTransport) return `Error: NATS transport not configured — broadcasts require AGENTS_NATS_URL.`;
+      if (bodyErr) throw new ToolFailure(`broadcast ${bodyErr}. Send a non-empty message.`);
+      if (!natsTransport) throw new ToolFailure("NATS transport not configured; broadcasts require AGENTS_NATS_URL. Ask the operator to set it, or use agent_dm if the bus is up.");
 
       const targetGroup = group === "all" ? null : (group || sender.group_name);
-      if (!targetGroup) return `Error: broadcast requires a target group.`;
+      if (!targetGroup) throw new ToolFailure("broadcast requires a target group. Pass group, or register with a group first.");
 
       const groupReachable = await broadcastGroupIsReachable(targetGroup, {
         localMemberCount: (g) => registry.getAgents(g).length,
         remoteMemberCount: (g) => natsTransport!.getRemotePeers(g).length,
       });
-      if (!groupReachable) return `Error: group '${targetGroup}' has no registered agents. Use agent_groups to see active groups.`;
+      if (!groupReachable) throw new ToolFailure(`group '${targetGroup}' has no registered agents. Call agent_groups to see active groups.`);
 
       logToFile("BROADCAST", `${name} -> ${targetGroup}: ${message}`);
       natsTransport.publishBroadcast(targetGroup, name, message);
@@ -306,16 +382,16 @@ export function createMcpServer(
         to: z.string().describe("Target agent name"),
         message: z.string().describe("Message content"),
       },
-      annotations: { readOnlyHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     async ({ name, to, message }) => withReady(async () => {
       requireOwner(name);
-      if (!natsTransport) return `Error: NATS transport not configured — DMs require AGENTS_NATS_URL.`;
+      if (!natsTransport) throw new ToolFailure("NATS transport not configured; DMs require AGENTS_NATS_URL. Ask the operator to set it.");
 
       const bodyErr = validateMessageBody(message);
-      if (bodyErr) return `Error: DM ${bodyErr}.`;
+      if (bodyErr) throw new ToolFailure(`DM ${bodyErr}. Send a non-empty message.`);
       const selfErr = validateDmTarget(name, to);
-      if (selfErr) return `Error: ${selfErr}.`;
+      if (selfErr) throw new ToolFailure(`${selfErr}. Pick another recipient with agent_discover.`);
 
       const reachable = await dmTargetIsReachable(to, {
         hasLocalAgent: () => !!registry.getAgentByName(to),
@@ -352,7 +428,7 @@ export function createMcpServer(
         include_stale: z.boolean().optional().default(false).describe("Include agents not seen in last 5 minutes"),
         group: z.string().optional().describe("Filter by group (omit for all)"),
       },
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ group }) => withReady(async () => {
       const agents = registry.getAgents(group || undefined);
@@ -376,7 +452,7 @@ export function createMcpServer(
       title: "List Groups",
       description: "List all active agent groups.",
       inputSchema: {},
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async () => withReady(async () => {
       const groups = registry.getGroups();
@@ -396,11 +472,11 @@ export function createMcpServer(
         channel: z.string().describe("Channel name"),
         message: z.string().describe("Message content"),
       },
-      annotations: { readOnlyHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     async ({ name, channel, message }) => withReady(async () => {
       requireOwner(name);
-      if (!natsTransport) return `Error: NATS transport not configured — channels require AGENTS_NATS_URL.`;
+      if (!natsTransport) throw new ToolFailure("NATS transport not configured; channels require AGENTS_NATS_URL. Ask the operator to set it.");
       logToFile("CHANNEL", `#${channel} ${name}: ${message}`);
       natsTransport.publishChannelMessage(channel, name, message);
       return `Message logged to #${channel}`;
@@ -414,33 +490,24 @@ export function createMcpServer(
       description: "Get recent messages from a channel.",
       inputSchema: {
         channel: z.string().describe("Channel name"),
-        limit: z.number().optional().default(50).describe("Max messages to return (default: 50)"),
+        limit: limitSchema(50).describe("Max messages to return, integer 1-500 (default: 50)"),
         detailed: z.boolean().optional().default(false).describe("Include full metadata (default: false, compact mode)"),
       },
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ channel, limit, detailed }) => withReady(async () => {
       const messages = await history.getChannelHistory(channel, limit);
       if (messages.length === 0) return `No messages in #${channel}`;
       if (detailed) {
-        return JSON.stringify({
-          channel,
-          count: messages.length,
-          messages: messages.map((m) => ({
-            id: m.id,
-            ...(m.message_id ? { message_id: m.message_id } : {}),
-            timestamp: m.timestamp,
-            from: m.from_agent,
-            content: m.content,
-          })),
-        });
+        return detailedHistory({ channel }, messages, (m) => ({
+          id: m.id,
+          ...(m.message_id ? { message_id: m.message_id } : {}),
+          timestamp: m.timestamp,
+          from: m.from_agent,
+          content: m.content,
+        }));
       }
-      const lines = messages.map((m) => {
-        const ts = new Date(m.timestamp).toLocaleTimeString();
-        const from = m.from_agent?.split("-")[0] || "unknown";
-        return `[${ts}] ${from}: ${m.content}`;
-      });
-      return `#${channel} history (${messages.length}):\n${lines.join("\n")}`;
+      return compactHistory((n) => `#${channel} history (${n})`, messages, "unknown");
     }),
   );
 
@@ -452,34 +519,25 @@ export function createMcpServer(
       inputSchema: {
         name: z.string().describe("Your agent name"),
         with_agent: z.string().describe("The other agent's name"),
-        limit: z.number().optional().default(50).describe("Max messages to return (default: 50)"),
+        limit: limitSchema(50).describe("Max messages to return, integer 1-500 (default: 50)"),
         detailed: z.boolean().optional().default(false).describe("Include full metadata (default: false, compact mode)"),
       },
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ name, with_agent, limit, detailed }) => withReady(async () => {
       requireOwner(name);
       const messages = await history.getDmHistory(name, with_agent, limit);
       if (messages.length === 0) return `No DM history with ${with_agent}`;
       if (detailed) {
-        return JSON.stringify({
-          with_agent,
-          count: messages.length,
-          messages: messages.map((m) => ({
-            id: m.id,
-            timestamp: m.timestamp,
-            from: m.from_agent,
-            to: m.to_agent,
-            content: m.content,
-          })),
-        });
+        return detailedHistory({ with_agent }, messages, (m) => ({
+          id: m.id,
+          timestamp: m.timestamp,
+          from: m.from_agent,
+          to: m.to_agent,
+          content: m.content,
+        }));
       }
-      const lines = messages.map((m) => {
-        const ts = new Date(m.timestamp).toLocaleTimeString();
-        const from = m.from_agent?.split("-")[0] || "unknown";
-        return `[${ts}] ${from}: ${m.content}`;
-      });
-      return `DM history with ${with_agent} (${messages.length}):\n${lines.join("\n")}`;
+      return compactHistory((n) => `DM history with ${with_agent} (${n})`, messages, "unknown");
     }),
   );
 
@@ -489,7 +547,7 @@ export function createMcpServer(
       title: "List Channels",
       description: "List all channels with message counts.",
       inputSchema: {},
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async () => withReady(async () => {
       const channels = await history.getChannels();
@@ -506,19 +564,14 @@ export function createMcpServer(
       description: "Get recent broadcast messages for a group.",
       inputSchema: {
         group: z.string().describe("Group name"),
-        limit: z.number().optional().default(50).describe("Max messages to return (default: 50)"),
+        limit: limitSchema(50).describe("Max messages to return, integer 1-500 (default: 50)"),
       },
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ group, limit }) => withReady(async () => {
       const messages = await history.getGroupHistory(group, limit);
       if (messages.length === 0) return `No history for group '${group}'`;
-      const lines = messages.map((m) => {
-        const ts = new Date(m.timestamp).toLocaleTimeString();
-        const from = m.from_agent?.split("-")[0] || "system";
-        return `[${ts}] ${from}: ${m.content}`;
-      });
-      return `Group '${group}' history (${messages.length}):\n${lines.join("\n")}`;
+      return compactHistory((n) => `Group '${group}' history (${n})`, messages, "system");
     }),
   );
 
@@ -528,16 +581,14 @@ export function createMcpServer(
       title: "Poll Messages",
       description: "Poll for new messages since a given ID (for TUI).",
       inputSchema: {
-        since_id: z.number().optional().default(0).describe("Return messages after this ID (0 for all)"),
-        limit: z.number().optional().default(100).describe("Max messages to return (default: 100)"),
+        since_id: sinceIdSchema.describe("Return messages after this ID (0 for all)"),
+        limit: limitSchema(100).describe("Max messages to return, integer 1-500 (default: 100)"),
       },
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ since_id, limit }) => withReady(async () => {
       const messages = await history.getMessagesSince(since_id || 0, limit);
-      if (messages.length === 0) return JSON.stringify({ messages: [], last_id: since_id || 0 });
-      const lastId = messages[messages.length - 1].id;
-      return JSON.stringify({ messages, last_id: lastId });
+      return pollResult(since_id || 0, messages.map((m) => ({ ...m, content: clipContent(m.content) })));
     }),
   );
 
@@ -548,22 +599,19 @@ export function createMcpServer(
       description: "Poll for new DMs and broadcasts since last check. Returns messages addressed to you. Use from a CronCreate loop.",
       inputSchema: {
         name: z.string().describe("Your agent name"),
-        since_id: z.number().optional().default(0).describe("Last seen message ID (0 for first poll)"),
+        since_id: sinceIdSchema.describe("Last seen message ID (0 for first poll)"),
       },
-      annotations: { readOnlyHint: true },
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ name, since_id }) => withReady(async () => {
       const agent = requireOwner(name);
       const messages = await history.getMessagesForAgent(name, agent.group_name, since_id || 0);
-      if (messages.length === 0) return JSON.stringify({ messages: [], last_id: since_id || 0 });
-      const lastId = messages[messages.length - 1].id;
-      const formatted = messages.map((m) => ({
+      return pollResult(since_id || 0, messages.map((m) => ({
         id: m.id,
         type: m.type,
         from: m.from_agent?.split("-")[0] || "unknown",
-        content: m.content,
-      }));
-      return JSON.stringify({ messages: formatted, last_id: lastId });
+        content: clipContent(m.content),
+      })));
     }),
   );
 
@@ -699,6 +747,9 @@ async function initInfra(): Promise<void> {
     const nc = transport.getConnection();
     if (!nc) throw new Error("NATS connection unavailable after init");
     await history.init(nc);
+    const claims = new NameClaims(kvStore(nc));
+    setInterval(() => void claims.refreshAll(), CLAIM_REFRESH_MS).unref();
+    nameClaims = claims;
     registry.setPresenceSource(transport);
     natsTransport = transport;
   } catch (err) {
@@ -781,6 +832,13 @@ export function createHttpServer(
       session.lastActivity = Date.now();
       await (session.transport as StreamableHTTPServerTransport).handleRequest(req, res, body);
     } catch (err) {
+      if (err instanceof RequestBodyError) {
+        if (!res.headersSent) {
+          res.writeHead(err.status, { "Content-Type": "application/json", ...(err.status === 413 ? { Connection: "close" } : {}) });
+          res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: err.code, message: err.message }, id: null }));
+        }
+        return;
+      }
       console.error("[http] request failed:", err);
       if (!res.headersSent) {
         res.writeHead(500, { "Content-Type": "application/json" });
@@ -826,14 +884,38 @@ async function startHttp(): Promise<void> {
   }, SESSION_SWEEP_INTERVAL_MS).unref();
 }
 
-function readBody(req: IncomingMessage): Promise<unknown> {
+// Largest request body the HTTP endpoint buffers. Tool calls are small text.
+export const MAX_BODY_BYTES = 1024 * 1024;
+
+class RequestBodyError extends Error {
+  constructor(readonly status: 400 | 413, readonly code: number, message: string) { super(message); }
+}
+
+// Buffer the body up to MAX_BODY_BYTES. Past the cap it stops buffering and
+// rejects at once, so a large upload never reaches memory or JSON.parse.
+function readBody(req: IncomingMessage, maxBytes = MAX_BODY_BYTES): Promise<unknown> {
   return new Promise((resolve, reject) => {
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      return reject(new RequestBodyError(413, -32600, `Request body exceeds ${maxBytes} bytes.`));
+    }
     const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
+    let received = 0;
+    const onData = (c: Buffer) => {
+      received += c.length;
+      if (received > maxBytes) {
+        req.off("data", onData);
+        chunks.length = 0;
+        req.resume();
+        return reject(new RequestBodyError(413, -32600, `Request body exceeds ${maxBytes} bytes.`));
+      }
+      chunks.push(c);
+    };
+    req.on("data", onData);
     req.on("end", () => {
       const raw = Buffer.concat(chunks).toString("utf-8");
       if (!raw) return resolve(undefined);
-      try { resolve(JSON.parse(raw)); } catch (err) { reject(err); }
+      try { resolve(JSON.parse(raw)); } catch { reject(new RequestBodyError(400, -32700, "Parse error: request body is not valid JSON.")); }
     });
     req.on("error", reject);
   });

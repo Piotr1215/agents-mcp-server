@@ -86,6 +86,7 @@ describe("stdio bus recovery", () => {
       arguments: { name: "recovery-alice", description: "recovery test" },
     });
     expect(text(unavailable)).toContain("Error: bus connecting, retry.");
+    expect(unavailable.isError).toBe(true);
 
     const nats = spawn(natsServerPath, ["--jetstream", "--store_dir", dataDir, "--port", String(port)], {
       stdio: "ignore",
